@@ -436,6 +436,9 @@ def _literal_sort_key(lit: ExtractedLiteral) -> tuple[int, str | int]:
 def _format_single_literal(lit: ExtractedLiteral) -> str:
     """Format a single literal value using double quotes for strings."""
     if lit.kind == "str" and isinstance(lit.value, str):
-        escaped = lit.value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
+        raw = repr(lit.value)
+        if raw.startswith('"'):
+            return raw
+        inner = raw[1:-1].replace('"', '\\"').replace("\\'", "'")
+        return f'"{inner}"'
     return repr(lit.value)

@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 import libcst as cst
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from py_type_narrower.config import NarrowerConfig
@@ -18,9 +18,9 @@ from py_type_narrower.indexer import index_files
 from py_type_narrower.rewriter import rewrite_module_source
 from py_type_narrower.rules import run_rules
 
-# Printable single-line ASCII strings (avoiding raw newlines/control chars)
+# Arbitrary UTF-8 strings including newlines, control chars, quotes, and backslashes
 _STR_LITERALS = st.text(
-    alphabet=st.characters(min_codepoint=32, max_codepoint=126),
+    alphabet=st.characters(blacklist_categories=("Cs",)),
     min_size=0,
     max_size=20,
 ).map(lambda s: ExtractedLiteral(kind="str", value=s))
@@ -36,6 +36,14 @@ _LITERAL_LISTS = st.one_of(
 
 
 @given(values=_LITERAL_LISTS)
+@example(
+    values=[
+        ExtractedLiteral(kind="str", value="\n"),
+        ExtractedLiteral(kind="str", value="\r\n\t"),
+        ExtractedLiteral(kind="str", value="a'b\"c\\d\\'e\\\"f"),
+        ExtractedLiteral(kind="str", value="\x00"),
+    ]
+)
 def test_format_literal_type_roundtrips_and_is_order_independent(
     values: list[ExtractedLiteral],
 ) -> None:
