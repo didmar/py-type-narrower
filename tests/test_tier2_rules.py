@@ -218,3 +218,29 @@ def run(project: Project, dyn: str) -> None:
     cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
     # Both `cache(dyn)` and `fetch()` (omitted exclude) are seen through `pkg.__init__` re-export!
     assert [c for c in cands if c.symbol.startswith("pkg.core.Project.")] == []
+
+
+def test_indexer_resolves_inherited_method_calls_on_subclasses(tmp_path: Path) -> None:
+    mod = tmp_path / "capture.py"
+    mod.write_text(
+        """class CaptureBase:
+    def _assert_state(self, op: str) -> None:
+        assert op
+
+    def start(self) -> None:
+        self._assert_state("start")
+
+    def done(self) -> None:
+        self._assert_state("done")
+
+class SysCapture(CaptureBase):
+    def snap(self) -> None:
+        self._assert_state("snap")
+""",
+        encoding="utf-8",
+    )
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    nt201 = [c for c in cands if c.code == RuleCode.NT201 and c.target_name == "op"]
+    assert len(nt201) == 1
+    assert nt201[0].suggested_type == 'Literal["done", "snap", "start"]'

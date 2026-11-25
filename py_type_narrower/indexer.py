@@ -226,12 +226,12 @@ def index_files(
             module_contexts.append(ctx)
 
     # Resolve class inheritance overrides and module re-exports across modules.
-    _mark_method_overrides(index)
+    classes_by_short_name = _mark_method_overrides(index)
     _resolve_module_reexports(module_contexts, index)
 
     # Pass 2: walk calls across all modules and bind arguments to target FunctionInfo params.
     for ctx in module_contexts:
-        _collect_module_calls(ctx, index)
+        _collect_module_calls(ctx, index, classes_by_short_name)
 
     return index
 
@@ -301,7 +301,7 @@ def _resolve_module_reexports(
             ctx.imports[local_name] = curr
 
 
-def _mark_method_overrides(index: RepoIndex) -> None:
+def _mark_method_overrides(index: RepoIndex) -> dict[str, list[ClassInfo]]:
     """Mark override relationships and base/external-subclass flags across indexed classes."""
     classes_by_short_name: dict[str, list[ClassInfo]] = {}
     for cls in index.classes.values():
@@ -323,6 +323,7 @@ def _mark_method_overrides(index: RepoIndex) -> None:
         func.is_overridden = (cls_qualname, func.name) in overridden_methods
         if _method_exists_in_bases(func.name, cls_info, index.classes, classes_by_short_name):
             func.is_override = True
+    return classes_by_short_name
 
 
 def _collect_class_hierarchy_facts(
@@ -341,29 +342,6 @@ def _collect_class_hierarchy_facts(
             for method_name in cls.methods & ancestor.methods:
                 overridden_methods.add((ancestor.qualname, method_name))
     return (external_subclasses, base_classes, overridden_methods)
-
-
-def _collect_indexed_ancestors(
-    cls_info: ClassInfo,
-    all_classes: dict[str, ClassInfo],
-    by_short_name: dict[str, list[ClassInfo]],
-) -> list[ClassInfo]:
-    """Return all distinct indexed ancestor ClassInfo objects of `cls_info`."""
-    ancestors: list[ClassInfo] = []
-    seen_quals: set[str] = {cls_info.qualname}
-    queue = list(cls_info.bases)
-    while queue:
-        base_name = _strip_base_type_args(queue.pop(0))
-        if base_name in TRIVIAL_BASE_NAMES:
-            continue
-        for base_cls in _lookup_base_classes(
-            base_name, cls_info.module_name, all_classes, by_short_name
-        ):
-            if base_cls.qualname not in seen_quals:
-                seen_quals.add(base_cls.qualname)
-                ancestors.append(base_cls)
-                queue.extend(base_cls.bases)
-    return ancestors
 
 
 def _has_external_base(
@@ -413,28 +391,6 @@ def _method_exists_in_bases(
                 return True
             queue.extend(base_cls.bases)
     return False
-
-
-def _strip_base_type_args(base_name: str) -> str:
-    """Strip generic arguments from a base class expression (e.g. `IO[str]` -> `IO`)."""
-    bracket = base_name.find("[")
-    return base_name[:bracket].strip() if bracket != -1 else base_name.strip()
-
-
-def _lookup_base_classes(
-    base_name: str,
-    current_module: str,
-    all_classes: dict[str, ClassInfo],
-    by_short_name: dict[str, list[ClassInfo]],
-) -> list[ClassInfo]:
-    """Resolve a base class name to indexed ClassInfo objects."""
-    if base_name in all_classes:
-        return [all_classes[base_name]]
-    same_mod = f"{current_module}.{base_name}"
-    if same_mod in all_classes:
-        return [all_classes[same_mod]]
-    short = base_name.rsplit(".", maxsplit=1)[-1]
-    return by_short_name.get(short, [])
 
 
 @dataclass(frozen=True)
@@ -977,9 +933,15 @@ class _CallSiteCollector(cst.CSTVisitor):
 
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self, ctx: _ModuleContext, index: RepoIndex) -> None:
+    def __init__(
+        self,
+        ctx: _ModuleContext,
+        index: RepoIndex,
+        classes_by_short_name: dict[str, list[ClassInfo]],
+    ) -> None:
         self.ctx = ctx
         self.index = index
+        self._classes_by_short_name = classes_by_short_name
         self._class_stack: list[str] = []
         # Each entry is `(is_class_scope, bindings)`; class scopes do not enclose methods in Python.
         self._scope_stack: list[tuple[bool, dict[str, _LocalVarBinding]]] = [(False, {})]
@@ -1289,16 +1251,27 @@ class _CallSiteCollector(cst.CSTVisitor):
         class_ref: str,
         method_name: str,
     ) -> FunctionInfo | None:
-        """Look up `class_ref.method_name` in current module or via imports."""
-        candidates = [
-            f"{module_name}.{class_ref}.{method_name}",
-        ]
+        """Look up `class_ref.method_name` directly or on indexed ancestor classes."""
+        cls_candidates = [f"{module_name}.{class_ref}"]
         imported = self.ctx.imports.get(class_ref)
         if imported is not None:
-            candidates.append(f"{imported}.{method_name}")
-        for qual in candidates:
-            if qual in self.index.functions:
-                return self.index.functions[qual]
+            cls_candidates.append(imported)
+
+        for cls_qual in cls_candidates:
+            direct = self.index.functions.get(f"{cls_qual}.{method_name}")
+            if direct is not None:
+                return direct
+
+        for cls_qual in cls_candidates:
+            cls_info = self.index.classes.get(cls_qual)
+            if cls_info is None:
+                continue
+            for ancestor in _collect_indexed_ancestors(
+                cls_info, self.index.classes, self._classes_by_short_name
+            ):
+                inherited = self.index.functions.get(f"{ancestor.qualname}.{method_name}")
+                if inherited is not None:
+                    return inherited
         return None
 
     def _lookup_local_var(self, name: str) -> _LocalVarBinding | None:
@@ -1469,7 +1442,58 @@ class _CallSiteCollector(cst.CSTVisitor):
         return any(c in self.index.classes for c in cls_candidates)
 
 
-def _collect_module_calls(ctx: _ModuleContext, index: RepoIndex) -> None:
+def _collect_indexed_ancestors(
+    cls_info: ClassInfo,
+    all_classes: dict[str, ClassInfo],
+    by_short_name: dict[str, list[ClassInfo]],
+) -> list[ClassInfo]:
+    """Return all distinct indexed ancestor ClassInfo objects of `cls_info`."""
+    ancestors: list[ClassInfo] = []
+    seen_quals: set[str] = {cls_info.qualname}
+    queue = list(cls_info.bases)
+    while queue:
+        base_name = _strip_base_type_args(queue.pop(0))
+        if base_name in TRIVIAL_BASE_NAMES:
+            continue
+        for base_cls in _lookup_base_classes(
+            base_name, cls_info.module_name, all_classes, by_short_name
+        ):
+            if base_cls.qualname not in seen_quals:
+                seen_quals.add(base_cls.qualname)
+                ancestors.append(base_cls)
+                queue.extend(base_cls.bases)
+    return ancestors
+
+
+def _strip_base_type_args(base_name: str) -> str:
+    """Strip generic arguments from a base class expression (e.g. `IO[str]` -> `IO`)."""
+    bracket = base_name.find("[")
+    return base_name[:bracket].strip() if bracket != -1 else base_name.strip()
+
+
+def _lookup_base_classes(
+    base_name: str,
+    current_module: str,
+    all_classes: dict[str, ClassInfo],
+    by_short_name: dict[str, list[ClassInfo]],
+) -> list[ClassInfo]:
+    """Resolve a base class name to indexed ClassInfo objects."""
+    if base_name in all_classes:
+        return [all_classes[base_name]]
+    same_mod = f"{current_module}.{base_name}"
+    if same_mod in all_classes:
+        return [all_classes[same_mod]]
+    short = base_name.rsplit(".", maxsplit=1)[-1]
+    return by_short_name.get(short, [])
+
+
+def _collect_module_calls(
+    ctx: _ModuleContext,
+    index: RepoIndex,
+    classes_by_short_name: dict[str, list[ClassInfo]],
+) -> None:
     """Visit a module to resolve call sites and aggregate per-parameter argument observations."""
-    collector = _CallSiteCollector(ctx=ctx, index=index)
+    collector = _CallSiteCollector(
+        ctx=ctx, index=index, classes_by_short_name=classes_by_short_name
+    )
     ctx.wrapper.visit(collector)
