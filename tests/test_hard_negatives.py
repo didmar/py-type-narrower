@@ -314,3 +314,41 @@ def run(v: MyVisitor, ann: ast.AnnAssign) -> None:
     assert [c for c in cands if c.symbol.endswith("visit_Assign")] == []
     # Private helpers on external-base subclasses are still analyzed normally.
     assert any(c.symbol.endswith("_internal") and c.code == RuleCode.NT201 for c in cands)
+
+
+def test_hard_negative_base_class_overridden_and_hook_returns_skipped(tmp_path: Path) -> None:
+    code = """class BaseNode:
+    def check_action(self) -> bool | None:
+        return True
+
+    def render(self) -> str:
+        return ""
+
+    def _gutter_width(self) -> int:
+        return 0
+
+    def leave_node(self, node: int) -> int | str:
+        return node
+
+    def _private_non_overridden(self, flag: bool) -> str | None:
+        return "a" if flag else "b"
+
+class SubNode(BaseNode):
+    def check_action(self) -> bool | None:
+        return None
+
+    def render(self) -> str:
+        return "sub"
+
+    def _gutter_width(self) -> int:
+        return 2
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=1)
+    by_sym = {(c.symbol.rsplit(".", maxsplit=1)[-1], c.code) for c in cands}
+    # Overridden base methods and open-world public base hooks must not have return types narrowed.
+    assert ("check_action", RuleCode.NT102) not in by_sym
+    assert ("render", RuleCode.NT103) not in by_sym
+    assert ("_gutter_width", RuleCode.NT103) not in by_sym
+    assert ("leave_node", RuleCode.NT105) not in by_sym
+    # Private non-overridden helper on the base class is still narrowed cleanly.
+    assert ("_private_non_overridden", RuleCode.NT102) in by_sym

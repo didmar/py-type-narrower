@@ -136,11 +136,11 @@ def _run_tier1_function_rules(
     if RuleCode.NT101 in active:
         out.extend(_rule_nt101_guarded_params(func, config))
 
-    nt105_cand = _rule_nt105_unused_union_return(func) if RuleCode.NT105 in active else None
+    nt105_cand = _rule_nt105_unused_union_return(func, config) if RuleCode.NT105 in active else None
     if nt105_cand is not None:
         out.append(nt105_cand)
     elif RuleCode.NT102 in active:
-        cand = _rule_nt102_unused_optional_return(func)
+        cand = _rule_nt102_unused_optional_return(func, config)
         if cand is not None:
             out.append(cand)
 
@@ -260,12 +260,15 @@ def _rule_nt101_guarded_params(
     return results
 
 
-def _rule_nt102_unused_optional_return(func: FunctionInfo) -> NarrowingCandidate | None:
+def _rule_nt102_unused_optional_return(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+) -> NarrowingCandidate | None:
     """NT102: Return type `T | None` never returns `None` along any path."""
     if (
         func.return_optional_inner is None
         or func.return_annotation_str is None
-        or _skip_return_narrowing_for_protocol(func)
+        or _skip_return_narrowing_for_protocol(func, config)
     ):
         return None
     ret = func.body_facts.returns
@@ -313,7 +316,7 @@ def _rule_nt103_literal_return(
         func.return_primitive_kind is None
         or func.return_annotation_str is None
         or func.is_override
-        or _skip_return_narrowing_for_protocol(func)
+        or _skip_return_narrowing_for_protocol(func, config)
     ):
         return None
     if (
@@ -409,14 +412,17 @@ def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandid
     return results
 
 
-def _rule_nt105_unused_union_return(func: FunctionInfo) -> NarrowingCandidate | None:
+def _rule_nt105_unused_union_return(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+) -> NarrowingCandidate | None:
     """NT105: Return union `A | B | C` has unused non-None branch(es)."""
     members = func.return_union_members
     ret = func.body_facts.returns
     if (
         members is None
         or func.return_annotation_str is None
-        or _skip_return_narrowing_for_protocol(func)
+        or _skip_return_narrowing_for_protocol(func, config)
         or ret.is_stub
         or ret.is_generator
         or not ret.has_returns
@@ -1027,9 +1033,15 @@ def _skip_param_narrowing_for_hierarchy(func: FunctionInfo) -> bool:
     )
 
 
-def _skip_return_narrowing_for_protocol(func: FunctionInfo) -> bool:
-    """Skip return narrowing on abstract, Protocol/ABC, and Python data-model methods."""
-    return func.is_abstract or func.in_protocol_or_abc or _is_data_model_dunder(func)
+def _skip_return_narrowing_for_protocol(func: FunctionInfo, config: NarrowerConfig) -> bool:
+    """Skip return narrowing on abstract, Protocol/ABC, data-model, or overridden base methods."""
+    return (
+        func.is_abstract
+        or func.in_protocol_or_abc
+        or func.is_overridden
+        or (func.in_base_class and not func.is_private and not config.closed_world)
+        or _is_data_model_dunder(func)
+    )
 
 
 def _is_data_model_dunder(func: FunctionInfo) -> bool:

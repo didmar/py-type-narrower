@@ -120,6 +120,8 @@ class FunctionInfo:
     body_facts: BodyFacts
     return_union_members: tuple[str, ...] | None = None
     in_external_subclass: bool = False
+    is_overridden: bool = False
+    in_base_class: bool = False
 
 
 @dataclass
@@ -300,16 +302,14 @@ def _resolve_module_reexports(
 
 
 def _mark_method_overrides(index: RepoIndex) -> None:
-    """Mark methods that override a base method or belong to a subclass of an external base."""
+    """Mark override relationships and base/external-subclass flags across indexed classes."""
     classes_by_short_name: dict[str, list[ClassInfo]] = {}
     for cls in index.classes.values():
         classes_by_short_name.setdefault(cls.name, []).append(cls)
 
-    external_subclasses: set[str] = {
-        qual
-        for qual, cls in index.classes.items()
-        if _has_external_base(cls, index.classes, classes_by_short_name)
-    }
+    external_subclasses, base_classes, overridden_methods = _collect_class_hierarchy_facts(
+        index.classes, classes_by_short_name
+    )
 
     for func in index.functions.values():
         if not func.is_method or func.class_name is None:
@@ -318,10 +318,52 @@ def _mark_method_overrides(index: RepoIndex) -> None:
         cls_info = index.classes.get(cls_qualname)
         if cls_info is None:
             continue
-        if cls_qualname in external_subclasses:
-            func.in_external_subclass = True
+        func.in_external_subclass = cls_qualname in external_subclasses
+        func.in_base_class = cls_qualname in base_classes
+        func.is_overridden = (cls_qualname, func.name) in overridden_methods
         if _method_exists_in_bases(func.name, cls_info, index.classes, classes_by_short_name):
             func.is_override = True
+
+
+def _collect_class_hierarchy_facts(
+    all_classes: dict[str, ClassInfo],
+    by_short_name: dict[str, list[ClassInfo]],
+) -> tuple[set[str], set[str], set[tuple[str, str]]]:
+    """Compute `(external_subclasses, base_classes_with_subclasses, overridden_methods)`."""
+    external_subclasses: set[str] = set()
+    base_classes: set[str] = set()
+    overridden_methods: set[tuple[str, str]] = set()
+    for qual, cls in all_classes.items():
+        if _has_external_base(cls, all_classes, by_short_name):
+            external_subclasses.add(qual)
+        for ancestor in _collect_indexed_ancestors(cls, all_classes, by_short_name):
+            base_classes.add(ancestor.qualname)
+            for method_name in cls.methods & ancestor.methods:
+                overridden_methods.add((ancestor.qualname, method_name))
+    return (external_subclasses, base_classes, overridden_methods)
+
+
+def _collect_indexed_ancestors(
+    cls_info: ClassInfo,
+    all_classes: dict[str, ClassInfo],
+    by_short_name: dict[str, list[ClassInfo]],
+) -> list[ClassInfo]:
+    """Return all distinct indexed ancestor ClassInfo objects of `cls_info`."""
+    ancestors: list[ClassInfo] = []
+    seen_quals: set[str] = {cls_info.qualname}
+    queue = list(cls_info.bases)
+    while queue:
+        base_name = _strip_base_type_args(queue.pop(0))
+        if base_name in TRIVIAL_BASE_NAMES:
+            continue
+        for base_cls in _lookup_base_classes(
+            base_name, cls_info.module_name, all_classes, by_short_name
+        ):
+            if base_cls.qualname not in seen_quals:
+                seen_quals.add(base_cls.qualname)
+                ancestors.append(base_cls)
+                queue.extend(base_cls.bases)
+    return ancestors
 
 
 def _has_external_base(
