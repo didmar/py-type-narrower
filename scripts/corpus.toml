@@ -1,0 +1,90 @@
+# Corpus manifest for testing py-type-narrower against real-world repositories.
+# Run with: uv run python scripts/run_corpus.py --group starter
+
+[[repos]]
+name = "py-type-narrower"
+local = "."
+paths = ["py_type_narrower"]
+closed_world = true
+groups = ["starter"]
+notes = "Dogfooding: closed-world CLI + library with clean ty baseline"
+
+[[repos]]
+name = "black"
+url = "https://github.com/psf/black.git"
+paths = ["src/black"]
+closed_world = true
+groups = ["starter"]
+notes = "Closed-world AST formatter with internal helpers, dataclasses, and mode strings"
+
+[[repos]]
+name = "httpx"
+url = "https://github.com/encode/httpx.git"
+paths = ["httpx"]
+closed_world = false
+groups = ["starter"]
+notes = "Compact typed HTTP library with state machines and str|bytes unions"
+
+[[repos]]
+name = "rich"
+url = "https://github.com/Textualize/rich.git"
+paths = ["rich"]
+closed_world = false
+groups = ["starter"]
+notes = "UI/formatting library rich in style/alignment string modes and class attributes"
+
+[[repos]]
+name = "pdm"
+url = "https://github.com/pdm-project/pdm.git"
+paths = ["src/pdm"]
+closed_world = true
+groups = ["starter"]
+notes = "Closed-world packaging CLI with config dataclasses, flags, and plugin hooks"
+
+[[repos]]
+name = "mcp-python-sdk"
+url = "https://github.com/modelcontextprotocol/python-sdk.git"
+paths = ["src/mcp"]
+closed_world = false
+groups = ["modern"]
+notes = "Modern Python 3.10+ protocol SDK with dataclasses, unions, and event literals"
+
+[[repos]]
+name = "typer"
+url = "https://github.com/fastapi/typer.git"
+paths = ["typer"]
+closed_world = false
+groups = ["modern"]
+notes = "Decorator/DI CLI framework with Optional defaults and dynamic invocation"
+
+[[repos]]
+name = "pydantic"
+url = "https://github.com/pydantic/pydantic.git"
+paths = ["pydantic"]
+closed_world = false
+groups = ["stress"]
+notes = "Metaprogramming-heavy library with complex core_schema unions and subclass hooks"
+
+[[repos]]
+name = "textual"
+url = "https://github.com/Textualize/textual.git"
+paths = ["src/textual"]
+closed_world = false
+groups = ["stress"]
+notes = "Large widget framework with deep inheritance, reactive descriptors, and lifecycle hooks"
+
+[[repos]]
+name = "pytest"
+url = "https://github.com/pytest-dev/pytest.git"
+paths = ["src/_pytest"]
+closed_world = true
+groups = ["stress"]
+notes = "Large plugin-based tool (pluggy hooks, fixtures, Optional attributes)"
+
+[[repos]]
+name = "libcst"
+url = "https://github.com/Instagram/LibCST.git"
+paths = ["libcst"]
+closed_world = false
+groups = ["stress"]
+notes = "Large CST library with deep frozen-dataclass node hierarchy and visitors"
