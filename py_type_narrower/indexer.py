@@ -369,6 +369,8 @@ class _DefinitionCollector(cst.CSTVisitor):
         self._func_depth = 0
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: N802
+        if _has_decorator(node, {"no_type_check"}):
+            return False
         pos = self.get_metadata(PositionProvider, node.name)
         bases = [expr_to_code(arg.value) for arg in node.bases]
         is_proto_abc = any(base in ABSTRACT_BASE_NAMES for base in bases)
@@ -487,13 +489,14 @@ class _DefinitionCollector(cst.CSTVisitor):
             is_kw_only=field_kw_only,
         )
 
-    def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: ARG002, N802
-        self._class_stack.pop()
+    def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: N802
+        if not _has_decorator(original_node, {"no_type_check"}):
+            self._class_stack.pop()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: N802
         in_nested = self._func_depth > 0
         self._func_depth += 1
-        if in_nested:
+        if in_nested or _has_decorator(node, {"no_type_check"}):
             return True
 
         pos = self.get_metadata(PositionProvider, node.name)
@@ -777,9 +780,9 @@ def _collect_top_level_class_names(module: cst.Module) -> set[str]:
     return {stmt.name.value for stmt in module.body if isinstance(stmt, cst.ClassDef)}
 
 
-def _has_decorator(func: cst.FunctionDef, names: set[str]) -> bool:
-    """Return True if a function has any decorator matching one of `names`."""
-    for dec in func.decorators:
+def _has_decorator(node: cst.FunctionDef | cst.ClassDef, names: set[str]) -> bool:
+    """Return True if a function or class has any decorator matching one of `names`."""
+    for dec in node.decorators:
         expr = dec.decorator
         if isinstance(expr, cst.Call):
             expr = expr.func

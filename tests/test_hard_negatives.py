@@ -236,3 +236,21 @@ def make_block() -> _Block:
 """
     cands = _run_on_code(tmp_path, code, max_tier=2)
     assert [c for c in cands if c.code == RuleCode.NT203] == []
+
+
+def test_hard_negative_no_type_check_skipped(tmp_path: Path) -> None:
+    code = """from typing import no_type_check
+
+@no_type_check
+def _ignored_fn(flag: bool) -> str | None:
+    if flag:
+        return "a"
+    return "b"
+
+@no_type_check
+class _IgnoredCls:
+    def status(self, ok: bool) -> str:
+        return "ok" if ok else "err"
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2)
+    assert cands == []
