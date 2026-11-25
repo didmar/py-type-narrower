@@ -37,6 +37,21 @@ ABSTRACT_BASE_NAMES: frozenset[str] = frozenset(
     {"ABC", "Protocol", "abc.ABC", "typing.Protocol", "typing_extensions.Protocol"}
 )
 NAMEDTUPLE_BASE_NAMES: frozenset[str] = frozenset({"NamedTuple", "typing.NamedTuple"})
+TRIVIAL_BASE_NAMES: frozenset[str] = (
+    ABSTRACT_BASE_NAMES
+    | NAMEDTUPLE_BASE_NAMES
+    | frozenset(
+        {
+            "object",
+            "builtins.object",
+            "Generic",
+            "typing.Generic",
+            "TypedDict",
+            "typing.TypedDict",
+            "typing_extensions.TypedDict",
+        }
+    )
+)
 
 
 @dataclass
@@ -104,6 +119,7 @@ class FunctionInfo:
     return_col: int
     body_facts: BodyFacts
     return_union_members: tuple[str, ...] | None = None
+    in_external_subclass: bool = False
 
 
 @dataclass
@@ -284,10 +300,16 @@ def _resolve_module_reexports(
 
 
 def _mark_method_overrides(index: RepoIndex) -> None:
-    """Mark methods that override a method on any base class or live in a subclass of ABC/Protocol."""
+    """Mark methods that override a base method or belong to a subclass of an external base."""
     classes_by_short_name: dict[str, list[ClassInfo]] = {}
     for cls in index.classes.values():
         classes_by_short_name.setdefault(cls.name, []).append(cls)
+
+    external_subclasses: set[str] = {
+        qual
+        for qual, cls in index.classes.items()
+        if _has_external_base(cls, index.classes, classes_by_short_name)
+    }
 
     for func in index.functions.values():
         if not func.is_method or func.class_name is None:
@@ -296,8 +318,34 @@ def _mark_method_overrides(index: RepoIndex) -> None:
         cls_info = index.classes.get(cls_qualname)
         if cls_info is None:
             continue
+        if cls_qualname in external_subclasses:
+            func.in_external_subclass = True
         if _method_exists_in_bases(func.name, cls_info, index.classes, classes_by_short_name):
             func.is_override = True
+
+
+def _has_external_base(
+    cls_info: ClassInfo,
+    all_classes: dict[str, ClassInfo],
+    by_short_name: dict[str, list[ClassInfo]],
+) -> bool:
+    """Return True if `cls_info` (or an indexed ancestor) inherits from an unindexed base class."""
+    visited: set[str] = set()
+    queue = list(cls_info.bases)
+    while queue:
+        raw_base = queue.pop(0)
+        base_name = _strip_base_type_args(raw_base)
+        if base_name in visited:
+            continue
+        visited.add(base_name)
+        if base_name in TRIVIAL_BASE_NAMES:
+            continue
+        matches = _lookup_base_classes(base_name, cls_info.module_name, all_classes, by_short_name)
+        if not matches:
+            return True
+        for base_cls in matches:
+            queue.extend(base_cls.bases)
+    return False
 
 
 def _method_exists_in_bases(
@@ -310,7 +358,8 @@ def _method_exists_in_bases(
     visited: set[str] = set()
     queue = list(cls_info.bases)
     while queue:
-        base_name = queue.pop(0)
+        raw_base = queue.pop(0)
+        base_name = _strip_base_type_args(raw_base)
         if base_name in visited:
             continue
         visited.add(base_name)
@@ -322,6 +371,12 @@ def _method_exists_in_bases(
                 return True
             queue.extend(base_cls.bases)
     return False
+
+
+def _strip_base_type_args(base_name: str) -> str:
+    """Strip generic arguments from a base class expression (e.g. `IO[str]` -> `IO`)."""
+    bracket = base_name.find("[")
+    return base_name[:bracket].strip() if bracket != -1 else base_name.strip()
 
 
 def _lookup_base_classes(

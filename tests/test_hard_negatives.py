@@ -274,3 +274,43 @@ def caller() -> None:
 """
     cands = _run_on_code(tmp_path, code, max_tier=2)
     assert [c for c in cands if c.code in {RuleCode.NT103, RuleCode.NT201}] == []
+
+
+def test_hard_negative_overrides_and_external_base_subclasses(tmp_path: Path) -> None:
+    code = """import ast
+from abc import ABC, abstractmethod
+from typing import IO
+
+class Splitter(ABC):
+    @abstractmethod
+    def get_icon(self) -> str: ...
+
+class RowSplitter(Splitter):
+    def get_icon(self) -> str:
+        return "row"
+
+class NullFile(IO[str]):
+    def read(self, n: int = 1) -> str:
+        return ""
+
+    def fileno(self) -> int:
+        return -1
+
+class MyVisitor(ast.NodeVisitor):
+    def visit_Assign(self, node: ast.Assign | ast.AnnAssign) -> None:
+        pass
+
+    def _internal(self, mode: str) -> int:
+        return len(mode)
+
+def run(v: MyVisitor, ann: ast.AnnAssign) -> None:
+    v.visit_Assign(ann)
+    v._internal("fast")
+    v._internal("slow")
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2)
+    # Overrides (`RowSplitter.get_icon`) and external-base public methods (`NullFile.*`, `visit_Assign`) skipped.
+    assert [c for c in cands if c.code == RuleCode.NT103] == []
+    assert [c for c in cands if c.symbol.endswith("visit_Assign")] == []
+    # Private helpers on external-base subclasses are still analyzed normally.
+    assert any(c.symbol.endswith("_internal") and c.code == RuleCode.NT201 for c in cands)

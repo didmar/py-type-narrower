@@ -159,6 +159,8 @@ def _run_tier2_function_rules(
     """Evaluate whole-repo call-site function rules (NT201, NT202, NT204, NT205)."""
     if _skip_param_narrowing_for_hierarchy(func):
         return
+    if func.in_external_subclass and not func.is_private and func.name != "__init__":
+        return
     nt101_params = {
         c.target_name for c in out if c.symbol == func.qualname and c.code == RuleCode.NT101
     }
@@ -310,6 +312,7 @@ def _rule_nt103_literal_return(
     if (
         func.return_primitive_kind is None
         or func.return_annotation_str is None
+        or func.is_override
         or _skip_return_narrowing_for_protocol(func)
     ):
         return None
@@ -330,6 +333,8 @@ def _rule_nt103_literal_return(
         or len(matching) > config.max_literals
         or _has_prose_or_overlong_literal(matching)
     ):
+        return None
+    if len(matching) == 1 and func.in_external_subclass and not func.is_private:
         return None
 
     suggested = format_literal_type(matching)
