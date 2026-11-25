@@ -1,0 +1,13 @@
+- id: py-type-narrower-check
+  name: py-type-narrower (check)
+  entry: py-type-narrower check
+  language: python
+  types: [python]
+  pass_filenames: false
+
+- id: py-type-narrower-fix
+  name: py-type-narrower (fix)
+  entry: py-type-narrower fix
+  language: python
+  types: [python]
+  pass_filenames: false
