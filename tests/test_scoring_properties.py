@@ -172,3 +172,17 @@ def test_canonical_score_ranges() -> None:
         )
     )
     assert weak_score < 45
+
+    single_call_private, _ = score_tier2_callsite_literal(
+        CallSiteScoreContext(
+            is_private=True,
+            closed_world=True,
+            call_count=1,
+            unique_value_count=1,
+            min_call_sites=2,
+            only_test_callers=False,
+            has_body_corroboration=False,
+            param_name="mode",
+        )
+    )
+    assert single_call_private < 50
