@@ -152,6 +152,7 @@ def matches_union_member(
     member: str,
     *,
     union_has_bool: bool = False,
+    union_has_int: bool = False,
 ) -> bool:
     """Return True if an observed type name can satisfy a declared union member."""
     obs = observed_type.strip()
@@ -166,8 +167,13 @@ def matches_union_member(
     if obs_base == mem_base or mem_base.rsplit(".", maxsplit=1)[-1] == obs_base:
         return True
 
-    # In Python, bool is a subtype of int; only match int if bool is not explicitly in the union.
-    if obs_base == "bool" and mem_base == "int" and not union_has_bool:
+    # PEP 484 numeric tower: bool -> int -> float (only when the narrower numeric isn't listed).
+    if _matches_numeric_tower(
+        obs_base,
+        mem_base,
+        union_has_bool=union_has_bool,
+        union_has_int=union_has_int,
+    ):
         return True
 
     # Literal[...] satisfies its underlying primitive union branch.
@@ -176,6 +182,21 @@ def matches_union_member(
 
     aliases = _CONTAINER_ALIASES.get(obs_base)
     return aliases is not None and mem_base.rsplit(".", maxsplit=1)[-1] in aliases
+
+
+def _matches_numeric_tower(
+    obs_base: str,
+    mem_base: str,
+    *,
+    union_has_bool: bool,
+    union_has_int: bool,
+) -> bool:
+    """Return True if `obs_base` widens to `mem_base` via PEP 484 numeric tower."""
+    if obs_base == "bool" and mem_base == "int" and not union_has_bool:
+        return True
+    if obs_base == "int" and mem_base == "float" and not union_has_int:
+        return True
+    return obs_base == "bool" and mem_base == "float" and not union_has_bool and not union_has_int
 
 
 _MIN_UNION_MEMBERS = 2

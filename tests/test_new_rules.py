@@ -240,3 +240,45 @@ def main() -> None:
         "def _deploy(dry_run: Literal[False] = False, verbose: bool = False) -> int:" in rewritten
     )
     assert "from typing import Literal" in rewritten
+
+
+def test_nt204_and_nt105_respect_type_aliases_numeric_tower_and_never_narrow_to_none(
+    tmp_path: Path,
+) -> None:
+    code = """from typing import Literal
+
+AlignMethod = Literal["top", "middle", "bottom"]
+
+class Base:
+    pass
+
+class Sub(Base):
+    pass
+
+def _align(vertical: AlignMethod | None = None) -> str:
+    return str(vertical)
+
+def _progress(completed: float | None = None) -> float:
+    return float(completed or 0)
+
+def _only_none(opt: str | None = None) -> str:
+    return opt or ""
+
+def _ret_subclass(flag: bool) -> Base | int:
+    if flag:
+        return Sub()
+    return 1
+
+def caller() -> None:
+    _align(None)
+    _align("middle")
+    _progress(None)
+    _progress(42)
+    _only_none(None)
+    _only_none()
+"""
+    mod = tmp_path / "aliases.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    assert [c for c in cands if c.code in {RuleCode.NT105, RuleCode.NT204}] == []

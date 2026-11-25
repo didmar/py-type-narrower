@@ -756,7 +756,7 @@ def _rule_nt204_unused_union_param(
         observed_types.add(param.default_type)
 
     used, unused = _partition_union_members(members, observed_types)
-    if not used or not unused or unused == ["None"]:
+    if not used or not unused or unused == ["None"] or used == ["None"]:
         return None
 
     call_count = len(stats.observations) + stats.omitted_count
@@ -887,14 +887,38 @@ def _partition_union_members(
     members: tuple[str, ...],
     observed_types: set[str],
 ) -> tuple[list[str], list[str]]:
-    """Split union members into `(used, unused)` based on observed type names."""
+    """Split union members into `(used, unused)` based on observed type names.
+
+    Returns `(list(members), [])` (no narrowing) if any observed type cannot be
+    matched to at least one declared member, which indicates an unresolved type
+    alias, protocol, or subclass relationship.
+    """
     expanded_observed = _expand_observed_union_types(observed_types)
     union_has_bool = any(m.strip() in {"bool", "builtins.bool"} for m in members)
+    union_has_int = any(m.strip() in {"int", "builtins.int"} for m in members)
+
+    for obs in expanded_observed:
+        if not any(
+            matches_union_member(
+                obs,
+                member,
+                union_has_bool=union_has_bool,
+                union_has_int=union_has_int,
+            )
+            for member in members
+        ):
+            return (list(members), [])
+
     used: list[str] = []
     unused: list[str] = []
     for member in members:
         if any(
-            matches_union_member(obs, member, union_has_bool=union_has_bool)
+            matches_union_member(
+                obs,
+                member,
+                union_has_bool=union_has_bool,
+                union_has_int=union_has_int,
+            )
             for obs in expanded_observed
         ):
             used.append(member)
