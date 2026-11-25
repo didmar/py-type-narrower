@@ -469,6 +469,7 @@ def _rule_nt201_callsite_literal(
     collected_counts = _collect_literal_counts(
         stats=stats,
         expected_kind=param.primitive_kind,
+        has_default=param.has_default,
         default_literal=param.default_literal,
     )
     if collected_counts is None:
@@ -622,6 +623,7 @@ def _check_field_literal(
     counts = _collect_literal_counts(
         stats=stats,
         expected_kind=fld.primitive_kind,
+        has_default=fld.has_default,
         default_literal=fld.default_literal,
     )
     if counts is None:
@@ -750,7 +752,7 @@ def _rule_nt204_unused_union_param(
             return None
         observed_types.add(obs.observed_type)
 
-    if stats.omitted_count > 0:
+    if stats.omitted_count > 0 or (param.has_default and not param.default_is_none):
         if param.default_type is None:
             return None
         observed_types.add(param.default_type)
@@ -818,6 +820,7 @@ def _rule_nt205_constant_bool_param(
     counts = _collect_literal_counts(
         stats=stats,
         expected_kind="bool",
+        has_default=param.has_default,
         default_literal=param.default_literal,
     )
     if counts is None or len(counts) != 1:
@@ -864,9 +867,10 @@ def _collect_literal_counts(
     *,
     stats: ParamCallStats,
     expected_kind: str,
+    has_default: bool,
     default_literal: ExtractedLiteral | None,
 ) -> Counter[ExtractedLiteral] | None:
-    """Aggregate literal counts across observations and omitted defaults, or None if unknown."""
+    """Aggregate literal counts across observations and parameter/field defaults."""
     counts: Counter[ExtractedLiteral] = Counter()
     for obs in stats.observations:
         if obs.is_unknown or obs.is_none or not obs.literals:
@@ -876,10 +880,13 @@ def _collect_literal_counts(
                 return None
             counts[lit] += 1
 
-    if stats.omitted_count > 0:
+    if has_default:
         if default_literal is None or default_literal.kind != expected_kind:
             return None
-        counts[default_literal] += stats.omitted_count
+        if stats.omitted_count > 0:
+            counts[default_literal] += stats.omitted_count
+        else:
+            counts.setdefault(default_literal, 0)
     return counts
 
 
@@ -1012,7 +1019,10 @@ def _build_callsite_literal_evidence(
     notes: list[str],
 ) -> list[EvidenceItem]:
     """Format human-readable value distribution and score factor evidence."""
-    dist_parts = [f"{lit.value!r} ({count}x)" for lit, count in counts.most_common()]
+    dist_parts = [
+        f"{lit.value!r} ({count}x)" if count > 0 else f"{lit.value!r} (default)"
+        for lit, count in counts.most_common()
+    ]
     items = [
         EvidenceItem(
             kind="call_sites",

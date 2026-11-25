@@ -282,3 +282,26 @@ def caller() -> None:
     index = index_files([mod], project_root=tmp_path)
     cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
     assert [c for c in cands if c.code in {RuleCode.NT105, RuleCode.NT204}] == []
+
+
+def test_tier2_rules_always_include_non_none_default_values(tmp_path: Path) -> None:
+    code = """def _emit(err: bool = False, mode: str = "fast", tag: str | int = "") -> str:
+    return f"{err}:{mode}:{tag}"
+
+def main() -> None:
+    _emit(True, "slow", 1)
+    _emit(True, "slow", 2)
+"""
+    mod = tmp_path / "defaults.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2))
+
+    # `err: bool = False` called only with True cannot narrow to Literal[True].
+    assert [c for c in cands if c.code == RuleCode.NT205] == []
+    # `tag: str | int = ""` called only with int still needs `str` for its `""` default.
+    assert [c for c in cands if c.code == RuleCode.NT204] == []
+    # `mode: str = "fast"` called with "slow" must keep "fast" in the suggested Literal.
+    nt201 = [c for c in cands if c.code == RuleCode.NT201]
+    assert len(nt201) == 1
+    assert nt201[0].suggested_type == 'Literal["fast", "slow"]'
