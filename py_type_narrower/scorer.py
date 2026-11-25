@@ -3,6 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+
+HIGH_CONFIDENCE_THRESHOLD = 75
+MEDIUM_CONFIDENCE_THRESHOLD = 45
+
+
+class ConfidenceBand(StrEnum):
+    """Coarse confidence bucket for scoring calibration and threshold-independent assertions."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+def confidence_band(score: int) -> ConfidenceBand:
+    """Map a 0-100 confidence score into HIGH, MEDIUM, or LOW."""
+    if score >= HIGH_CONFIDENCE_THRESHOLD:
+        return ConfidenceBand.HIGH
+    if score >= MEDIUM_CONFIDENCE_THRESHOLD:
+        return ConfidenceBand.MEDIUM
+    return ConfidenceBand.LOW
+
 
 OPEN_DOMAIN_PARAM_NAMES: frozenset[str] = frozenset(
     {

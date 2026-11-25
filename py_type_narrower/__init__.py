@@ -10,11 +10,13 @@ from py_type_narrower.models import (
     Tier,
     VerificationStatus,
 )
+from py_type_narrower.scorer import ConfidenceBand, confidence_band
 
 __version__ = "0.1.0"
 
 __all__ = [
     "AnalysisResult",
+    "ConfidenceBand",
     "NarrowerConfig",
     "NarrowingCandidate",
     "RuleCode",
@@ -24,5 +26,6 @@ __all__ = [
     "VerificationStatus",
     "__version__",
     "analyze_paths",
+    "confidence_band",
     "load_config",
 ]
