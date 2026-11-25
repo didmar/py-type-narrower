@@ -254,3 +254,23 @@ class _IgnoredCls:
 """
     cands = _run_on_code(tmp_path, code, max_tier=2)
     assert cands == []
+
+
+def test_hard_negative_prose_and_overlong_string_literals_skipped(tmp_path: Path) -> None:
+    code = """def _banner() -> str:
+    return "Project plugins need to be moved from .pdm-plugins to the cache directory."
+
+def _ask(question: str) -> str:
+    return question
+
+def _report(message: str) -> str:
+    return message
+
+def caller() -> None:
+    _ask("Project name")
+    _ask("Python requires('*' to allow any)")
+    _report("matches a .gitignore file content")
+    _report("matches the --exclude regular expression")
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2)
+    assert [c for c in cands if c.code in {RuleCode.NT103, RuleCode.NT201}] == []

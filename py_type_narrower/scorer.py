@@ -31,6 +31,10 @@ OPEN_DOMAIN_PARAM_NAMES: frozenset[str] = frozenset(
         "comment",
         "sql",
         "prompt",
+        "question",
+        "reason",
+        "error",
+        "warning",
         "prefix",
         "suffix",
     }

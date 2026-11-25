@@ -328,6 +328,7 @@ def _rule_nt103_literal_return(
         len(matching) != len(ret.returned_literals)
         or not matching
         or len(matching) > config.max_literals
+        or _has_prose_or_overlong_literal(matching)
     ):
         return None
 
@@ -476,7 +477,11 @@ def _rule_nt201_callsite_literal(
         return None
 
     unique_lits = set(collected_counts.keys())
-    if not unique_lits or len(unique_lits) > config.max_literals:
+    if (
+        not unique_lits
+        or len(unique_lits) > config.max_literals
+        or _has_prose_or_overlong_literal(unique_lits)
+    ):
         return None
 
     total_calls = len(stats.observations) + stats.omitted_count
@@ -629,7 +634,11 @@ def _check_field_literal(
     if counts is None:
         return None
     unique_lits = set(counts.keys())
-    if not unique_lits or len(unique_lits) > config.max_literals:
+    if (
+        not unique_lits
+        or len(unique_lits) > config.max_literals
+        or _has_prose_or_overlong_literal(unique_lits)
+    ):
         return None
 
     total_calls = len(stats.observations) + stats.omitted_count
@@ -949,6 +958,23 @@ def _expand_observed_union_types(observed_types: set[str]) -> set[str]:
         else:
             expanded.add(obs)
     return expanded
+
+
+_MAX_LITERAL_STR_LEN = 40
+_PROSE_WORD_THRESHOLD = 3
+
+
+def _has_prose_or_overlong_literal(literals: set[ExtractedLiteral]) -> bool:
+    """Return True if any string literal looks like UI prose or exceeds the token length cap."""
+    return any(
+        lit.kind == "str"
+        and isinstance(lit.value, str)
+        and (
+            len(lit.value) > _MAX_LITERAL_STR_LEN
+            or len(lit.value.strip().split()) >= _PROSE_WORD_THRESHOLD
+        )
+        for lit in literals
+    )
 
 
 def _cannot_drop_param_none_default(func: FunctionInfo, param: ParamInfo) -> bool:
