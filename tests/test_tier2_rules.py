@@ -183,3 +183,38 @@ def test_it() -> None:
     assert len(nt201) == 1
     assert any("test callers" in e.detail for e in nt201[0].evidence)
     assert nt201[0].score <= 55
+
+
+def test_indexer_resolves_package_init_reexports(tmp_path: Path) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    core = pkg / "core.py"
+    core.write_text(
+        """class Project:
+    def cache(self, name: str) -> str:
+        return name
+
+    def fetch(self, *, exclude: list[str] | None = None) -> int:
+        return len(exclude or [])
+""",
+        encoding="utf-8",
+    )
+    init = pkg / "__init__.py"
+    init.write_text("from pkg.core import Project\n", encoding="utf-8")
+    caller = tmp_path / "caller.py"
+    caller.write_text(
+        """from pkg import Project
+
+def run(project: Project, dyn: str) -> None:
+    project.cache("wheels")
+    project.cache(dyn)
+    project.fetch()
+    project.fetch(exclude=["a"])
+""",
+        encoding="utf-8",
+    )
+
+    index = index_files([init, core, caller], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    # Both `cache(dyn)` and `fetch()` (omitted exclude) are seen through `pkg.__init__` re-export!
+    assert [c for c in cands if c.symbol.startswith("pkg.core.Project.")] == []

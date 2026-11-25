@@ -207,8 +207,9 @@ def index_files(
         if ctx is not None:
             module_contexts.append(ctx)
 
-    # Resolve class inheritance overrides across modules.
+    # Resolve class inheritance overrides and module re-exports across modules.
     _mark_method_overrides(index)
+    _resolve_module_reexports(module_contexts, index)
 
     # Pass 2: walk calls across all modules and bind arguments to target FunctionInfo params.
     for ctx in module_contexts:
@@ -254,6 +255,32 @@ def _read_source(path: Path, overrides: dict[Path, str] | None) -> str | None:
     except (OSError, UnicodeDecodeError) as exc:
         logger.warning("Skipping unreadable file %s: %s", path, exc)
         return None
+
+
+_MAX_REEXPORT_HOPS = 8
+
+
+def _resolve_module_reexports(
+    module_contexts: list[_ModuleContext],
+    index: RepoIndex,
+) -> None:
+    """Resolve package `__init__.py` and module re-exports transitively in `ctx.imports`."""
+    reexports: dict[str, str] = {}
+    for ctx in module_contexts:
+        for local_name, target_qual in ctx.imports.items():
+            alias_qual = f"{ctx.module_name}.{local_name}"
+            if alias_qual not in index.functions and alias_qual not in index.classes:
+                reexports[alias_qual] = target_qual
+
+    for ctx in module_contexts:
+        for local_name, target_qual in list(ctx.imports.items()):
+            curr = target_qual
+            for _ in range(_MAX_REEXPORT_HOPS):
+                nxt = reexports.get(curr)
+                if nxt is None or nxt == curr:
+                    break
+                curr = nxt
+            ctx.imports[local_name] = curr
 
 
 def _mark_method_overrides(index: RepoIndex) -> None:
@@ -872,13 +899,14 @@ class _CallSiteCollector(cst.CSTVisitor):
             ann = p.annotation
             lits = extract_literal_values_from_annotation(ann)
             ann_str = expr_to_code(ann.annotation) if ann is not None else None
+            class_ref = ann_str.strip("'\"") if ann_str is not None else None
             is_non_none = (
                 ann is not None and extract_optional_inner(ann) is None and ann_str != "None"
             )
             scope[p.name.value] = _LocalVarBinding(
                 literals=lits,
                 is_non_none=is_non_none,
-                class_type=ann_str,
+                class_type=class_ref,
                 inferred_type=ann_str,
             )
         self._scope_stack.append((False, scope))
