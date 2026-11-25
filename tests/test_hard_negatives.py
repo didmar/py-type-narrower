@@ -191,3 +191,30 @@ def run() -> None:
     cands = _run_on_code(tmp_path, code, max_tier=2, max_literals=3)
     assert {c.code for c in cands} - {RuleCode.NT101, RuleCode.NT103, RuleCode.NT201} == set()
     assert cands == []
+
+
+def test_hard_negative_nt101_reassigned_param_and_conditional_dict_subscript(
+    tmp_path: Path,
+) -> None:
+    code = """DEFAULT_REPOS = {"pypi": "https://pypi.org", "testpypi": "https://test.pypi.org"}
+
+def normalize_shell(shell: str = "AUTO") -> int:
+    shell = shell.lower()
+    match shell:
+        case "bash" | "zsh":
+            return 1
+        case _:
+            raise ValueError(shell)
+
+def lookup_repo(name_or_url: str) -> str:
+    if name_or_url in DEFAULT_REPOS:
+        return DEFAULT_REPOS[name_or_url]
+    return name_or_url
+
+def lookup_with_early_return(name: str) -> str:
+    if name.startswith("http"):
+        return name
+    return DEFAULT_REPOS[name]
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=1)
+    assert [c for c in cands if c.code == RuleCode.NT101] == []

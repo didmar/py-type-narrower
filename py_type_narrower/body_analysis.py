@@ -159,8 +159,10 @@ def _analyze_param_guards(
 ) -> dict[str, ParamGuardInfo]:
     """Detect strict and soft literal guards on parameters in a function body."""
     guards: dict[str, ParamGuardInfo] = {name: ParamGuardInfo() for name in param_names}
-    _scan_statements_for_guards(stmts, param_names, guards)
-    _scan_const_dict_subscripts(stmts, param_names, module_const_dicts, guards)
+    reassigned = _collect_reassigned_names(stmts)
+    strict_param_names = param_names - reassigned
+    _scan_statements_for_guards(stmts, strict_param_names, guards)
+    _scan_const_dict_subscripts(stmts, strict_param_names, module_const_dicts, guards)
     _scan_soft_comparisons(stmts, param_names, guards)
     return guards
 
@@ -691,8 +693,85 @@ def _is_non_none_call(call: cst.Call, known_class_names: set[str]) -> bool:
     return False
 
 
+class _ReassignedNameCollector(cst.CSTVisitor):
+    """Collect local variable names rebound anywhere in a function body."""
+
+    def __init__(self) -> None:
+        self.reassigned: set[str] = set()
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Lambda(self, node: cst.Lambda) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Assign(self, node: cst.Assign) -> bool:  # noqa: N802
+        for assign_target in node.targets:
+            self._collect_target_names(assign_target.target)
+        return True
+
+    def visit_AugAssign(self, node: cst.AugAssign) -> bool:  # noqa: N802
+        self._collect_target_names(node.target)
+        return True
+
+    def visit_AnnAssign(self, node: cst.AnnAssign) -> bool:  # noqa: N802
+        if node.value is not None:
+            self._collect_target_names(node.target)
+        return True
+
+    def visit_For(self, node: cst.For) -> bool:  # noqa: N802
+        self._collect_target_names(node.target)
+        return True
+
+    def visit_WithItem(self, node: cst.WithItem) -> bool:  # noqa: N802
+        if node.asname is not None:
+            self._collect_target_names(node.asname.name)
+        return True
+
+    def visit_NamedExpr(self, node: cst.NamedExpr) -> bool:  # noqa: N802
+        self._collect_target_names(node.target)
+        return True
+
+    def _collect_target_names(self, target: cst.BaseExpression) -> None:
+        """Recursively collect bound Name targets from simple or unpacked assignments."""
+        if isinstance(target, cst.Name):
+            self.reassigned.add(target.value)
+        elif isinstance(target, (cst.Tuple, cst.List)):
+            for elem in target.elements:
+                if isinstance(elem, (cst.Element, cst.StarredElement)):
+                    self._collect_target_names(elem.value)
+
+
+def _collect_reassigned_names(stmts: list[cst.BaseStatement]) -> set[str]:
+    """Return all variable names reassigned inside `stmts` (excluding nested defs)."""
+    collector = _ReassignedNameCollector()
+    for stmt in stmts:
+        stmt.visit(collector)
+    return collector.reassigned
+
+
+class _ReturnPresenceVisitor(cst.CSTVisitor):
+    """Check whether a statement contains any Return (excluding nested defs)."""
+
+    def __init__(self) -> None:
+        self.has_return = False
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Return(self, node: cst.Return) -> bool:  # noqa: ARG002, N802
+        self.has_return = True
+        return False
+
+
 class _ConstDictSubscriptVisitor(cst.CSTVisitor):
-    """Detect `{'a': 1, 'b': 2}[param]` and `CONST_DICT[param]` lookups inside a function."""
+    """Detect unconditional `{'a': 1}[param]` and `CONST_DICT[param]` lookups."""
 
     def __init__(
         self,
@@ -708,6 +787,45 @@ class _ConstDictSubscriptVisitor(cst.CSTVisitor):
         return False
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_If(self, node: cst.If) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Try(self, node: cst.Try) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_TryStar(self, node: cst.TryStar) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_For(self, node: cst.For) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_While(self, node: cst.While) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Match(self, node: cst.Match) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_IfExp(self, node: cst.IfExp) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_BooleanOperation(self, node: cst.BooleanOperation) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Lambda(self, node: cst.Lambda) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_ListComp(self, node: cst.ListComp) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_SetComp(self, node: cst.SetComp) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_DictComp(self, node: cst.DictComp) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_GeneratorExp(self, node: cst.GeneratorExp) -> bool:  # noqa: ARG002, N802
         return False
 
     def visit_Subscript(self, node: cst.Subscript) -> bool:  # noqa: N802
@@ -740,7 +858,7 @@ def _scan_const_dict_subscripts(
     module_const_dicts: dict[str, set[ExtractedLiteral]],
     guards: dict[str, ParamGuardInfo],
 ) -> None:
-    """Detect `{'a': ..., 'b': ...}[param]` or `CONST_DICT[param]` subscripts."""
+    """Detect unconditional `{'a': ..., 'b': ...}[param]` or `CONST_DICT[param]` subscripts."""
     visitor = _ConstDictSubscriptVisitor(
         param_names=param_names,
         module_const_dicts=module_const_dicts,
@@ -748,6 +866,15 @@ def _scan_const_dict_subscripts(
     )
     for stmt in stmts:
         stmt.visit(visitor)
+        if _stmt_contains_return(stmt):
+            break
+
+
+def _stmt_contains_return(stmt: cst.BaseStatement) -> bool:
+    """Return True if `stmt` contains any return statement in the current function."""
+    visitor = _ReturnPresenceVisitor()
+    stmt.visit(visitor)
+    return visitor.has_return
 
 
 def _record_strict_guard(
