@@ -29,6 +29,37 @@ if TYPE_CHECKING:
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import FunctionInfo, ParamCallStats, ParamInfo, RepoIndex
 
+# Python data-model protocol methods whose signatures are fixed by the runtime/typeshed.
+# User-defined API dunders like __init__, __call__, and __getitem__ are intentionally excluded.
+DATA_MODEL_DUNDER_METHODS: frozenset[str] = frozenset(
+    {
+        "__repr__",
+        "__str__",
+        "__bytes__",
+        "__format__",
+        "__exit__",
+        "__aexit__",
+        "__bool__",
+        "__len__",
+        "__length_hint__",
+        "__hash__",
+        "__index__",
+        "__int__",
+        "__float__",
+        "__complex__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__contains__",
+        "__dir__",
+        "__sizeof__",
+        "__fspath__",
+    }
+)
+
 
 def run_rules(index: RepoIndex, config: NarrowerConfig) -> list[NarrowingCandidate]:
     """Evaluate all enabled narrowing rules against a RepoIndex."""
@@ -161,9 +192,11 @@ def _rule_nt101_guarded_params(
 
 def _rule_nt102_unused_optional_return(func: FunctionInfo) -> NarrowingCandidate | None:
     """NT102: Return type `T | None` never returns `None` along any path."""
-    if func.return_optional_inner is None or func.return_annotation_str is None:
-        return None
-    if func.is_abstract or func.in_protocol_or_abc:
+    if (
+        func.return_optional_inner is None
+        or func.return_annotation_str is None
+        or _skip_return_narrowing_for_protocol(func)
+    ):
         return None
     ret = func.body_facts.returns
     if ret.is_stub or ret.is_generator or not ret.has_returns:
@@ -209,8 +242,7 @@ def _rule_nt103_literal_return(
     if (
         func.return_primitive_kind is None
         or func.return_annotation_str is None
-        or func.is_abstract
-        or func.in_protocol_or_abc
+        or _skip_return_narrowing_for_protocol(func)
     ):
         return None
     if (
@@ -398,8 +430,23 @@ def _rule_nt202_unused_optional_param(
 
 
 def _skip_param_narrowing_for_hierarchy(func: FunctionInfo) -> bool:
-    """Skip parameter narrowing on overrides, ABCs, Protocols, and abstract methods."""
-    return func.is_override or func.is_abstract or func.in_protocol_or_abc
+    """Skip parameter narrowing on overrides, ABCs, Protocols, abstract, and data-model methods."""
+    return (
+        func.is_override
+        or func.is_abstract
+        or func.in_protocol_or_abc
+        or _is_data_model_dunder(func)
+    )
+
+
+def _skip_return_narrowing_for_protocol(func: FunctionInfo) -> bool:
+    """Skip return narrowing on abstract, Protocol/ABC, and Python data-model methods."""
+    return func.is_abstract or func.in_protocol_or_abc or _is_data_model_dunder(func)
+
+
+def _is_data_model_dunder(func: FunctionInfo) -> bool:
+    """Return True if func is a fixed Python data-model protocol method."""
+    return func.is_method and func.name in DATA_MODEL_DUNDER_METHODS
 
 
 def _non_receiver_params(func: FunctionInfo) -> list[ParamInfo]:

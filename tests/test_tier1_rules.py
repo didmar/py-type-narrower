@@ -165,3 +165,41 @@ def exit_code(ok: bool) -> int:
     assert set(nt103.keys()) == {"_status"}
     assert nt103["_status"].suggested_type == 'Literal["err", "ok"]'
     assert nt103["_status"].score == 90
+
+
+def test_data_model_dunders_skipped_but_api_dunders_analyzed(tmp_path: Path) -> None:
+    code = """
+class Widget:
+    def __repr__(self) -> str:
+        return "Widget"
+
+    def __str__(self) -> str:
+        return "Widget"
+
+    def __len__(self) -> int:
+        return 1
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool | None:
+        return False
+
+    def __call__(self, flag: bool) -> str | None:
+        if flag:
+            return "yes"
+        return "no"
+
+    def __getitem__(self, key: str) -> int:
+        if key == "x":
+            return 1
+        elif key == "y":
+            return 2
+        else:
+            raise KeyError(key)
+"""
+    cands = _analyze_snippet(tmp_path, code)
+    by_method = {(c.symbol.rsplit(".", maxsplit=1)[-1], c.code) for c in cands}
+    assert ("__repr__", RuleCode.NT103) not in by_method
+    assert ("__str__", RuleCode.NT103) not in by_method
+    assert ("__len__", RuleCode.NT103) not in by_method
+    assert ("__exit__", RuleCode.NT102) not in by_method
+    assert ("__call__", RuleCode.NT102) in by_method
+    assert ("__getitem__", RuleCode.NT101) in by_method
