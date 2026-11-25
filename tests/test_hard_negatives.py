@@ -218,3 +218,21 @@ def lookup_with_early_return(name: str) -> str:
 """
     cands = _run_on_code(tmp_path, code, max_tier=1)
     assert [c for c in cands if c.code == RuleCode.NT101] == []
+
+
+def test_hard_negative_class_attr_does_not_leak_into_module_scope(tmp_path: Path) -> None:
+    code = """from dataclasses import dataclass
+
+@dataclass
+class _Block:
+    after: int = 0
+
+def _compute() -> tuple[int, int]:
+    return (1, 2)
+
+def make_block() -> _Block:
+    before, after = _compute()
+    return _Block(after=after)
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2)
+    assert [c for c in cands if c.code == RuleCode.NT203] == []

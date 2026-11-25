@@ -854,13 +854,16 @@ class _CallSiteCollector(cst.CSTVisitor):
         self.ctx = ctx
         self.index = index
         self._class_stack: list[str] = []
-        self._scope_stack: list[dict[str, _LocalVarBinding]] = [{}]
+        # Each entry is `(is_class_scope, bindings)`; class scopes do not enclose methods in Python.
+        self._scope_stack: list[tuple[bool, dict[str, _LocalVarBinding]]] = [(False, {})]
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: N802
         self._class_stack.append(node.name.value)
+        self._scope_stack.append((True, {}))
         return True
 
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: ARG002, N802
+        self._scope_stack.pop()
         self._class_stack.pop()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: N802
@@ -878,7 +881,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                 class_type=ann_str,
                 inferred_type=ann_str,
             )
-        self._scope_stack.append(scope)
+        self._scope_stack.append((False, scope))
         return True
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:  # noqa: ARG002, N802
@@ -891,6 +894,11 @@ class _CallSiteCollector(cst.CSTVisitor):
                 self._record_var_value(target.value, node.value, annotation=None)
             elif isinstance(target, cst.Attribute):
                 self._record_attr_write(target, node.value)
+            else:
+                self._bind_unknown_target(target)
+        else:
+            for assign_target in node.targets:
+                self._bind_unknown_target(assign_target.target)
         return True
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> bool:  # noqa: N802
@@ -900,7 +908,7 @@ class _CallSiteCollector(cst.CSTVisitor):
 
     def visit_AugAssign(self, node: cst.AugAssign) -> bool:  # noqa: N802
         if isinstance(node.target, cst.Name):
-            scope = self._scope_stack[-1]
+            scope = self._scope_stack[-1][1]
             existing = scope.get(node.target.value)
             if existing is not None:
                 scope[node.target.value] = _LocalVarBinding(
@@ -910,6 +918,24 @@ class _CallSiteCollector(cst.CSTVisitor):
                     inferred_type=existing.inferred_type,
                 )
         return True
+
+    def visit_For(self, node: cst.For) -> bool:  # noqa: N802
+        self._bind_unknown_target(node.target)
+        return True
+
+    def visit_WithItem(self, node: cst.WithItem) -> bool:  # noqa: N802
+        if node.asname is not None:
+            self._bind_unknown_target(node.asname.name)
+        return True
+
+    def _bind_unknown_target(self, target: cst.BaseExpression) -> None:
+        """Bind simple or unpacked target names as unknown so they shadow outer scopes."""
+        if isinstance(target, cst.Name):
+            self._scope_stack[-1][1][target.value] = _LocalVarBinding()
+        elif isinstance(target, (cst.Tuple, cst.List)):
+            for elem in target.elements:
+                if isinstance(elem, (cst.Element, cst.StarredElement)):
+                    self._bind_unknown_target(elem.value)
 
     def visit_Call(self, node: cst.Call) -> bool:  # noqa: N802
         pos = self.get_metadata(PositionProvider, node)
@@ -1021,7 +1047,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         annotation: cst.Annotation | None,
     ) -> None:
         """Update local scope knowledge for a variable assignment."""
-        scope = self._scope_stack[-1]
+        scope = self._scope_stack[-1][1]
         ann_lits = extract_literal_values_from_annotation(annotation)
         ann_str = expr_to_code(annotation.annotation) if annotation is not None else None
         ann_non_none = (
@@ -1148,9 +1174,11 @@ class _CallSiteCollector(cst.CSTVisitor):
         return None
 
     def _lookup_local_var(self, name: str) -> _LocalVarBinding | None:
-        """Look up a variable binding from innermost scope outward."""
-        for scope in reversed(self._scope_stack):
-            if name in scope:
+        """Look up a variable binding from innermost scope outward, skipping enclosing class scopes."""
+        if name in self._scope_stack[-1][1]:
+            return self._scope_stack[-1][1][name]
+        for is_class_scope, scope in reversed(self._scope_stack[:-1]):
+            if not is_class_scope and name in scope:
                 return scope[name]
         return None
 
