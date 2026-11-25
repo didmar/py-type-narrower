@@ -216,17 +216,38 @@ class _NarrowingTransformer(cst.CSTTransformer):
         params: cst.Parameters,
         edits: dict[str, NarrowingCandidate],
     ) -> cst.Parameters:
-        """Update matching parameters in posonly, regular, and kwonly lists."""
+        """Update matching parameters while preserving valid positional default ordering."""
+        seen_default = False
+        new_posonly: list[cst.Param] = []
+        for param in params.posonly_params:
+            updated = self._update_single_param(param, edits, allow_drop_default=not seen_default)
+            if updated.default is not None:
+                seen_default = True
+            new_posonly.append(updated)
+
+        new_regular: list[cst.Param] = []
+        for param in params.params:
+            updated = self._update_single_param(param, edits, allow_drop_default=not seen_default)
+            if updated.default is not None:
+                seen_default = True
+            new_regular.append(updated)
+
+        new_kwonly = [
+            self._update_single_param(p, edits, allow_drop_default=True)
+            for p in params.kwonly_params
+        ]
         return params.with_changes(
-            posonly_params=[self._update_single_param(p, edits) for p in params.posonly_params],
-            params=[self._update_single_param(p, edits) for p in params.params],
-            kwonly_params=[self._update_single_param(p, edits) for p in params.kwonly_params],
+            posonly_params=new_posonly,
+            params=new_regular,
+            kwonly_params=new_kwonly,
         )
 
     def _update_single_param(
         self,
         param: cst.Param,
         edits: dict[str, NarrowingCandidate],
+        *,
+        allow_drop_default: bool,
     ) -> cst.Param:
         """Rewrite annotation (and optionally drop `= None` default) on a single Param."""
         cand = edits.get(param.name.value)
@@ -238,7 +259,7 @@ class _NarrowingTransformer(cst.CSTTransformer):
         if cand.needs_literal_import:
             self.added_literal = True
 
-        if cand.drop_none_default:
+        if cand.drop_none_default and allow_drop_default:
             return param.with_changes(
                 annotation=new_ann,
                 equal=cst.MaybeSentinel.DEFAULT,

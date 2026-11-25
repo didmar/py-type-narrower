@@ -535,6 +535,8 @@ def _rule_nt202_unused_optional_param(
         return None
     if param.default_is_none and stats.omitted_count > 0:
         return None
+    if _cannot_drop_param_none_default(func, param):
+        return None
     if any(obs.is_none or not obs.is_non_none for obs in stats.observations):
         return None
 
@@ -679,6 +681,8 @@ def _check_field_optional(
         return None
     if fld.default_is_none and stats.omitted_count > 0:
         return None
+    if _cannot_drop_field_none_default(cls, fld):
+        return None
     if any(obs.is_none or not obs.is_non_none for obs in stats.observations):
         return None
 
@@ -758,6 +762,8 @@ def _rule_nt204_unused_union_param(
     call_count = len(stats.observations) + stats.omitted_count
     only_test = all(obs.is_test_caller for obs in stats.observations)
     drops_none = "None" in unused and param.default_is_none
+    if drops_none and _cannot_drop_param_none_default(func, param):
+        return None
     score, notes = score_tier2_unused_optional_param(
         OptionalParamScoreContext(
             is_private=func.is_private,
@@ -912,6 +918,30 @@ def _expand_observed_union_types(observed_types: set[str]) -> set[str]:
         else:
             expanded.add(obs)
     return expanded
+
+
+def _cannot_drop_param_none_default(func: FunctionInfo, param: ParamInfo) -> bool:
+    """Return True if dropping `= None` on `param` would violate Python default ordering."""
+    if not param.default_is_none or param.kind == "kwonly":
+        return False
+    for prev in func.parameters:
+        if prev is param:
+            break
+        if prev.kind in {"posonly", "regular"} and prev.has_default:
+            return True
+    return False
+
+
+def _cannot_drop_field_none_default(cls: ClassInfo, fld: FieldInfo) -> bool:
+    """Return True if dropping `= None` on dataclass/NamedTuple `fld` breaks field ordering."""
+    if not fld.default_is_none or fld.is_kw_only:
+        return False
+    for prev in cls.fields:
+        if prev is fld:
+            break
+        if not prev.is_kw_only and prev.has_default:
+            return True
+    return False
 
 
 def _class_has_subclasses(cls: ClassInfo, index: RepoIndex) -> bool:
