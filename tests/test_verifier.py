@@ -175,3 +175,32 @@ def test_resolve_verifier_errors_and_custom(tmp_path: Path) -> None:
     custom = resolve_verifier("custom", tmp_path, custom_command="true")
     assert isinstance(custom, CustomCommandAdapter)
     assert custom.check(tmp_path) == set()
+
+
+def test_ty_baseline_matches_materialized_package_subdirs(tmp_path: Path) -> None:
+    """Pre-existing errors in a package subdir must be in baseline, not treated as new errors."""
+    adapter = TyAdapter()
+    if not adapter.is_available():
+        pytest.skip("ty is not installed in PATH")
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "broken.py").write_text('x: int = "pre-existing-error"\n', encoding="utf-8")
+    good = pkg / "good.py"
+    good.write_text(
+        """def _status(ok: bool) -> str:
+    if ok:
+        return "ok"
+    return "err"
+""",
+        encoding="utf-8",
+    )
+
+    index = index_files([pkg / "__init__.py", pkg / "broken.py", good], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    assert [c.code for c in cands] == [RuleCode.NT103]
+
+    verified, rejected = verify_candidates(cands, index.files, tmp_path, adapter)
+    assert [c.code for c in verified] == [RuleCode.NT103]
+    assert rejected == []

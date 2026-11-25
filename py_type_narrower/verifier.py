@@ -12,7 +12,10 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from py_type_narrower.models import (
     CheckerDiagnostic,
@@ -73,7 +76,10 @@ def verify_candidates(
         return ([], [])
 
     python_exe = _detect_project_python(project_root)
-    baseline = _run_check_in_shadow(project_root, {}, adapter, python_exe)
+    source_paths = tuple(sources.keys())
+    baseline = _run_check_in_shadow(
+        project_root, {}, adapter, python_exe, source_paths=source_paths
+    )
     ctx = _BisectContext(
         sources=sources,
         project_root=project_root,
@@ -96,7 +102,13 @@ def _bisect_verify(
 ) -> None:
     """Verify a batch of candidates; bisect recursively on any newly introduced errors."""
     patched = rewrite_files(candidates, ctx.sources)
-    diags = _run_check_in_shadow(ctx.project_root, patched, ctx.adapter, ctx.python_exe)
+    diags = _run_check_in_shadow(
+        ctx.project_root,
+        patched,
+        ctx.adapter,
+        ctx.python_exe,
+        source_paths=ctx.sources.keys(),
+    )
     new_errors = [
         d for d in diags if d.severity == "error" and d.signature() not in ctx.baseline_sigs
     ]
@@ -124,12 +136,14 @@ def _run_check_in_shadow(
     patched_files: dict[Path, str],
     adapter: TypeCheckerAdapter,
     python_exe: Path | None,
+    *,
+    source_paths: Iterable[Path] = (),
 ) -> set[CheckerDiagnostic]:
     """Materialize a lightweight symlinked shadow workspace and invoke the type checker."""
     root = project_root.resolve()
     with tempfile.TemporaryDirectory(prefix="py_type_narrower_") as tmp:
         shadow_root = Path(tmp)
-        _populate_shadow_tree(root, shadow_root, patched_files)
+        _populate_shadow_tree(root, shadow_root, patched_files, source_paths)
         return adapter.check(shadow_root, python_exe=python_exe)
 
 
@@ -137,20 +151,26 @@ def _populate_shadow_tree(
     source_root: Path,
     shadow_root: Path,
     patched_files: dict[Path, str],
+    source_paths: Iterable[Path] = (),
 ) -> None:
-    """Symlink unmodified entries and write patched files into materialized parent dirs."""
+    """Symlink unmodified entries and materialize parent dirs for all analyzed & patched files."""
     rel_patched: dict[Path, str] = {}
     dirs_to_materialize: set[Path] = {Path()}
+    for abs_path in (*source_paths, *patched_files.keys()):
+        try:
+            rel = abs_path.resolve().relative_to(source_root)
+        except ValueError:
+            continue
+        curr = rel.parent
+        while curr != Path():
+            dirs_to_materialize.add(curr)
+            curr = curr.parent
     for abs_path, content in patched_files.items():
         try:
             rel = abs_path.resolve().relative_to(source_root)
         except ValueError:
             continue
         rel_patched[rel] = content
-        curr = rel.parent
-        while curr != Path():
-            dirs_to_materialize.add(curr)
-            curr = curr.parent
 
     _mirror_directory(source_root, shadow_root, Path(), dirs_to_materialize, rel_patched)
 
