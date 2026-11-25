@@ -9,8 +9,10 @@ import libcst as cst
 
 from py_type_narrower.cst_utils import (
     ExtractedLiteral,
+    expr_to_code,
     extract_literal,
     extract_optional_inner,
+    infer_simple_expr_type,
     is_definitely_non_none_expr,
     is_none_expr,
 )
@@ -28,6 +30,8 @@ class ReturnSummary:
     all_returns_non_none: bool = True
     has_non_literal_return: bool = False
     returned_literals: set[ExtractedLiteral] = field(default_factory=set)
+    returned_types: set[str] = field(default_factory=set)
+    has_unknown_return_type: bool = False
 
 
 @dataclass
@@ -52,10 +56,16 @@ def analyze_function_body(
     param_non_none_names: set[str],
     module_const_dicts: dict[str, set[ExtractedLiteral]],
     known_class_names: set[str],
+    param_types: dict[str, str] | None = None,
 ) -> BodyFacts:
     """Analyze return paths and parameter literal guards for a function definition."""
     stmts = _extract_body_statements(func.body)
-    returns = _analyze_returns(stmts, param_non_none_names, known_class_names)
+    returns = _analyze_returns(
+        stmts,
+        param_non_none_names,
+        known_class_names,
+        param_types=param_types or {},
+    )
     param_names = _collect_param_names(func.params)
     guards = _analyze_param_guards(stmts, param_names, module_const_dicts)
     return BodyFacts(returns=returns, param_guards=guards)
@@ -346,8 +356,14 @@ def filter_literals_by_kind(
 class _ReturnCollector(cst.CSTVisitor):
     """Collect return statements and yield expressions without descending into nested defs."""
 
-    def __init__(self, local_non_none: set[str], known_class_names: set[str]) -> None:
+    def __init__(
+        self,
+        local_non_none: set[str],
+        local_types: dict[str, str],
+        known_class_names: set[str],
+    ) -> None:
         self.local_non_none = local_non_none
+        self.local_types = local_types
         self.known_class_names = known_class_names
         self.is_generator = False
         self.has_returns = False
@@ -355,6 +371,8 @@ class _ReturnCollector(cst.CSTVisitor):
         self.all_returns_non_none = True
         self.has_non_literal_return = False
         self.returned_literals: set[ExtractedLiteral] = set()
+        self.returned_types: set[str] = set()
+        self.has_unknown_return_type = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
         return False
@@ -372,10 +390,17 @@ class _ReturnCollector(cst.CSTVisitor):
             self.returns_none = True
             self.all_returns_non_none = False
             self.has_non_literal_return = True
+            self.returned_types.add("None")
             return False
 
         if not _expr_is_non_none_in_scope(node.value, self.local_non_none, self.known_class_names):
             self.all_returns_non_none = False
+
+        inferred = _infer_expr_types_in_scope(node.value, self.local_types, self.known_class_names)
+        if inferred is None:
+            self.has_unknown_return_type = True
+        else:
+            self.returned_types.update(inferred)
 
         lit = extract_literal(node.value)
         if lit is not None:
@@ -389,6 +414,8 @@ def _analyze_returns(
     stmts: list[cst.BaseStatement],
     param_non_none_names: set[str],
     known_class_names: set[str],
+    *,
+    param_types: dict[str, str],
 ) -> ReturnSummary:
     """Inspect all return statements and control flow inside a function body."""
     summary = ReturnSummary()
@@ -397,7 +424,12 @@ def _analyze_returns(
         return summary
 
     local_non_none = _collect_local_non_none_names(stmts, param_non_none_names, known_class_names)
-    collector = _ReturnCollector(local_non_none=local_non_none, known_class_names=known_class_names)
+    local_types = _collect_local_types(stmts, param_types, known_class_names)
+    collector = _ReturnCollector(
+        local_non_none=local_non_none,
+        local_types=local_types,
+        known_class_names=known_class_names,
+    )
     for stmt in stmts:
         stmt.visit(collector)
 
@@ -407,8 +439,99 @@ def _analyze_returns(
     summary.all_returns_non_none = collector.all_returns_non_none
     summary.has_non_literal_return = collector.has_non_literal_return
     summary.returned_literals = collector.returned_literals
+    summary.returned_types = collector.returned_types
+    summary.has_unknown_return_type = collector.has_unknown_return_type
     summary.can_fallthrough = not _block_always_terminates(stmts)
     return summary
+
+
+class _LocalTypeVisitor(cst.CSTVisitor):
+    """Track simple local variable type assignments conservatively."""
+
+    def __init__(
+        self,
+        known: dict[str, str],
+        conflicted: set[str],
+        known_class_names: set[str],
+    ) -> None:
+        self.known = known
+        self.conflicted = conflicted
+        self.known_class_names = known_class_names
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: ARG002, N802
+        return False
+
+    def visit_Assign(self, node: cst.Assign) -> bool:  # noqa: N802
+        inferred = _infer_expr_types_in_scope(node.value, self.known, self.known_class_names)
+        single = next(iter(inferred)) if inferred is not None and len(inferred) == 1 else None
+        for assign_target in node.targets:
+            if isinstance(assign_target.target, cst.Name):
+                self._record(assign_target.target.value, single)
+        return True
+
+    def visit_AnnAssign(self, node: cst.AnnAssign) -> bool:  # noqa: N802
+        if isinstance(node.target, cst.Name):
+            self._record(node.target.value, expr_to_code(node.annotation.annotation))
+        return True
+
+    def _record(self, name: str, typ: str | None) -> None:
+        """Record a variable's type or mark it conflicted on mismatch/unknown."""
+        if typ is None:
+            self.conflicted.add(name)
+            return
+        existing = self.known.get(name)
+        if existing is None:
+            self.known[name] = typ
+        elif existing != typ:
+            self.conflicted.add(name)
+
+
+def _collect_local_types(
+    stmts: list[cst.BaseStatement],
+    param_types: dict[str, str],
+    known_class_names: set[str],
+) -> dict[str, str]:
+    """Conservatively collect single-type bindings for local variables in a function body."""
+    known: dict[str, str] = dict(param_types)
+    conflicted: set[str] = set()
+    visitor = _LocalTypeVisitor(
+        known=known,
+        conflicted=conflicted,
+        known_class_names=known_class_names,
+    )
+    for stmt in stmts:
+        stmt.visit(visitor)
+    return {name: typ for name, typ in known.items() if name not in conflicted}
+
+
+def _infer_expr_types_in_scope(
+    expr: cst.BaseExpression,
+    local_types: dict[str, str],
+    known_class_names: set[str],
+) -> set[str] | None:
+    """Infer the set of possible static type names for a return expression, or None if unknown."""
+    if isinstance(expr, cst.IfExp):
+        left = _infer_expr_types_in_scope(expr.body, local_types, known_class_names)
+        right = _infer_expr_types_in_scope(expr.orelse, local_types, known_class_names)
+        return (left | right) if (left is not None and right is not None) else None
+    simple = infer_simple_expr_type(expr)
+    if simple is not None:
+        return {simple}
+    if isinstance(expr, cst.Name) and expr.value in local_types:
+        typ = local_types[expr.value]
+        if typ in {"Any", "typing.Any", "object", "builtins.object"}:
+            return None
+        return {typ}
+    if (
+        isinstance(expr, cst.Call)
+        and isinstance(expr.func, cst.Name)
+        and expr.func.value in known_class_names
+    ):
+        return {expr.func.value}
+    return None
 
 
 def _is_stub_body(stmts: list[cst.BaseStatement]) -> bool:

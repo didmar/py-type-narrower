@@ -1,6 +1,15 @@
 # py-type-narrower
 
-A LibCST-powered static analyzer and refactoring tool that detects overly broad Python type annotations (like `str`, `int`, or `T | None`) and suggests or applies narrower types (like `Literal["a", "b"]` or `T`), with optional **soundness verification** backed by your preferred type checker (`ty`, `mypy`, `pyright`, `basedpyright`, or a custom command).
+A LibCST-powered static analyzer and refactoring tool that detects overly broad Python type annotations (like `str`, `int`, `bool`, `T | None`, or `A | B | C`) and suggests or applies narrower types (like `Literal["a", "b"]`, `T`, or `A | B`), with optional **soundness verification** backed by your preferred type checker (`ty`, `mypy`, `pyright`, `basedpyright`, or a custom command).
+
+## Design Philosophy & Non-Goals
+
+`py-type-narrower` is built to **complement** static type checkers (`ty`, `mypy`, `pyright`), not replace or duplicate them. Standard type checkers verify *soundness* and deliberately permit annotations that are looser than actual usage.
+
+Out of scope (already handled by type checkers or Ruff):
+- Redundant casts or unnecessary `isinstance` checks (`--warn-redundant-casts`, `reportUnnecessaryIsInstance`)
+- Duplicate union members (`int | int`)
+- Missing annotations (`ruff ANN`, `--disallow-untyped-defs`) or bare `Any` bans (`ANN401`, `--disallow-any-explicit`)
 
 ## Rules & Tiers
 
@@ -11,10 +20,15 @@ Rules are split into two tiers by evidence strength:
 | `NT101` | 1 (Local) | Parameter typed `str`/`int` is exhaustively guarded to literals in the function body (`if/elif/else raise`, negative guard + raise, `match`, or constant dict subscript) | Safe (default) |
 | `NT102` | 1 (Local) | Return type `T \| None` / `Optional[T]` never returns `None` along any path | Safe (default) |
 | `NT103` | 1 (Local) | Return type `str`/`int` only returns constant literals | Safe (default) |
+| `NT104` | 1 (Local) | Class attribute `T \| None` is always initialized non-`None` in `__init__` and never set to `None` | Safe (default) |
+| `NT105` | 1 (Local) | Return union `A \| B \| C` has unused branch(es) | Safe (default) |
 | `NT201` | 2 (Whole-repo) | Parameter typed `str`/`int` only receives literals from a small set across all callers (also flags single-constant parameters) | Requires `--unsafe-fixes` |
 | `NT202` | 2 (Whole-repo) | Parameter typed `T \| None` never receives `None` across callers | Requires `--unsafe-fixes` |
+| `NT203` | 2 (Whole-repo) | Dataclass / `NamedTuple` field (`str`/`int` or `T \| None`) can be narrowed across instantiations and writes | Requires `--unsafe-fixes` |
+| `NT204` | 2 (Whole-repo) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
+| `NT205` | 2 (Whole-repo) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
 
-Parameter narrowing automatically skips subclass method overrides, `Protocol`s, `ABC`s, and `@abstractmethod`s to avoid breaking Liskov substitution.
+Parameter narrowing automatically skips subclass method overrides, `Protocol`s, `ABC`s, `@abstractmethod`s, and Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, etc.) to avoid breaking Liskov substitution.
 
 ## Usage
 
@@ -72,20 +86,20 @@ def handle(mode: str) -> int:  # type-narrow: ignore[NT201]
 ```toml
 [tool.py-type-narrower]
 max-tier = 2
-min-confidence = 60
+min-confidence = 50
 closed-world = true
 max-literals = 8
 min-call-sites = 2
 max-passes = 2
 verify = true
 verifier = "ty"
-select = ["NT101", "NT102", "NT103", "NT201", "NT202"]
+select = ["NT101", "NT102", "NT103", "NT104", "NT105", "NT201", "NT202", "NT203", "NT204", "NT205"]
 ignore = []
 ```
 
 ### Optional Flake8 Plugin
 
-Install with the `flake8` extra to expose Tier 1 (`NT101`, `NT102`, `NT103`) single-file rules directly in `flake8`:
+Install with the `flake8` extra to expose Tier 1 (`NT101`–`NT105`) single-file rules directly in `flake8`:
 
 ```bash
 pip install "py-type-narrower[flake8]"

@@ -6,13 +6,15 @@ from hypothesis import strategies as st
 from py_type_narrower.scorer import (
     OPEN_DOMAIN_PARAM_NAMES,
     CallSiteScoreContext,
-    ConfidenceBand,
+    ConstantBoolScoreContext,
     OptionalParamScoreContext,
-    confidence_band,
+    score_tier1_always_initialized_attr,
     score_tier1_guarded_param,
     score_tier1_literal_return,
     score_tier1_unused_optional_return,
+    score_tier1_unused_union_return,
     score_tier2_callsite_literal,
+    score_tier2_constant_bool_param,
     score_tier2_unused_optional_param,
 )
 
@@ -42,16 +44,28 @@ _OPTIONAL_CTX = st.builds(
     has_none_default=st.booleans(),
 )
 
+_BOOL_CTX = st.builds(
+    ConstantBoolScoreContext,
+    is_private=st.booleans(),
+    closed_world=st.booleans(),
+    call_count=st.integers(min_value=1, max_value=50),
+    min_call_sites=st.integers(min_value=1, max_value=5),
+    only_test_callers=st.booleans(),
+    has_default=st.booleans(),
+)
+
 
 @given(is_private=st.booleans(), closed_world=st.booleans())
-def test_tier1_scores_always_in_high_band(*, is_private: bool, closed_world: bool) -> None:
-    s1 = score_tier1_guarded_param(is_private=is_private)
-    s2 = score_tier1_unused_optional_return(is_private=is_private)
-    s3 = score_tier1_literal_return(is_private=is_private, closed_world=closed_world)
-
-    for score in (s1, s2, s3):
-        assert 0 <= score <= 100
-        assert confidence_band(score) == ConfidenceBand.HIGH
+def test_tier1_scores_always_high(*, is_private: bool, closed_world: bool) -> None:
+    scores = (
+        score_tier1_guarded_param(is_private=is_private),
+        score_tier1_unused_optional_return(is_private=is_private),
+        score_tier1_literal_return(is_private=is_private, closed_world=closed_world),
+        score_tier1_always_initialized_attr(is_private=is_private),
+        score_tier1_unused_union_return(is_private=is_private),
+    )
+    for score in scores:
+        assert 75 <= score <= 100
 
 
 @given(ctx=_CALLSITE_CTX)
@@ -60,7 +74,6 @@ def test_nt201_score_bounds_and_monotonicity(ctx: CallSiteScoreContext) -> None:
     assert 0 <= score <= 100
     assert isinstance(notes, list)
 
-    # Visibility & closed-world monotonicity: private / closed-world never lowers score
     priv_score, _ = score_tier2_callsite_literal(replace(ctx, is_private=True))
     pub_score, _ = score_tier2_callsite_literal(replace(ctx, is_private=False))
     assert priv_score >= pub_score
@@ -69,21 +82,17 @@ def test_nt201_score_bounds_and_monotonicity(ctx: CallSiteScoreContext) -> None:
     ow_score, _ = score_tier2_callsite_literal(replace(ctx, closed_world=False))
     assert cw_score >= ow_score
 
-    # Caller evidence monotonicity: more calls never lowers score
     more_calls, _ = score_tier2_callsite_literal(replace(ctx, call_count=ctx.call_count + 5))
     assert more_calls >= score
 
-    # Body corroboration never lowers score
     with_body, _ = score_tier2_callsite_literal(replace(ctx, has_body_corroboration=True))
     without_body, _ = score_tier2_callsite_literal(replace(ctx, has_body_corroboration=False))
     assert with_body >= without_body
 
-    # Test-only callers never increases score
     prod_score, _ = score_tier2_callsite_literal(replace(ctx, only_test_callers=False))
     test_score, _ = score_tier2_callsite_literal(replace(ctx, only_test_callers=True))
     assert prod_score >= test_score
 
-    # Open-domain param name never outranks domain-neutral param name
     neutral_score, _ = score_tier2_callsite_literal(replace(ctx, param_name="mode"))
     open_score, _ = score_tier2_callsite_literal(replace(ctx, param_name="filename"))
     assert neutral_score >= open_score
@@ -114,8 +123,28 @@ def test_nt202_score_bounds_and_monotonicity(ctx: OptionalParamScoreContext) -> 
     assert no_default >= with_default
 
 
-def test_canonical_band_expectations() -> None:
-    # Strong internal repeated literal param with body check => HIGH
+@given(ctx=_BOOL_CTX)
+def test_nt205_score_bounds_and_monotonicity(ctx: ConstantBoolScoreContext) -> None:
+    score, _ = score_tier2_constant_bool_param(ctx)
+    assert 0 <= score <= 100
+
+    priv_score, _ = score_tier2_constant_bool_param(replace(ctx, is_private=True))
+    pub_score, _ = score_tier2_constant_bool_param(replace(ctx, is_private=False))
+    assert priv_score >= pub_score
+
+    cw_score, _ = score_tier2_constant_bool_param(replace(ctx, closed_world=True))
+    ow_score, _ = score_tier2_constant_bool_param(replace(ctx, closed_world=False))
+    assert cw_score >= ow_score
+
+    more_calls, _ = score_tier2_constant_bool_param(replace(ctx, call_count=ctx.call_count + 5))
+    assert more_calls >= score
+
+    prod_score, _ = score_tier2_constant_bool_param(replace(ctx, only_test_callers=False))
+    test_score, _ = score_tier2_constant_bool_param(replace(ctx, only_test_callers=True))
+    assert prod_score >= test_score
+
+
+def test_canonical_score_ranges() -> None:
     strong_score, _ = score_tier2_callsite_literal(
         CallSiteScoreContext(
             is_private=True,
@@ -128,9 +157,8 @@ def test_canonical_band_expectations() -> None:
             param_name="mode",
         )
     )
-    assert confidence_band(strong_score) == ConfidenceBand.HIGH
+    assert strong_score >= 75
 
-    # Public API with open-domain name called once in tests => LOW
     weak_score, _ = score_tier2_callsite_literal(
         CallSiteScoreContext(
             is_private=False,
@@ -143,4 +171,4 @@ def test_canonical_band_expectations() -> None:
             param_name="filename",
         )
     )
-    assert confidence_band(weak_score) == ConfidenceBand.LOW
+    assert weak_score < 45

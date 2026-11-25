@@ -68,17 +68,20 @@ def compute_unified_diffs(
 
 
 class _NarrowingTransformer(cst.CSTTransformer):
-    """Apply parameter and return narrowing edits to matching FunctionDef nodes."""
+    """Apply parameter, return, and attribute narrowing edits to matching CST nodes."""
 
     def __init__(self, candidates: list[NarrowingCandidate]) -> None:
         self._class_stack: list[str] = []
-        self._func_depth = 0
+        self._func_stack: list[str] = []
         self.added_literal = False
         self._by_func: dict[tuple[str | None, str], list[NarrowingCandidate]] = defaultdict(list)
+        self._by_attr: dict[tuple[str, str], NarrowingCandidate] = {}
+
         for cand in candidates:
             parts = cand.symbol.split(".")
-            # Store under (class_name, func_name) when class-qualified, and also (None, func_name)
-            # for top-level functions.
+            if cand.target_kind == TargetKind.ATTRIBUTE and cand.target_name is not None:
+                self._by_attr[(parts[-1], cand.target_name)] = cand
+                continue
             self._by_func[(None, parts[-1])].append(cand)
             if len(parts) >= _MIN_QUALIFIED_PARTS:
                 self._by_func[(parts[-2], parts[-1])].append(cand)
@@ -95,8 +98,8 @@ class _NarrowingTransformer(cst.CSTTransformer):
         self._class_stack.pop()
         return updated_node
 
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
-        self._func_depth += 1
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: N802
+        self._func_stack.append(node.name.value)
         return True
 
     def leave_FunctionDef(  # noqa: N802
@@ -104,8 +107,8 @@ class _NarrowingTransformer(cst.CSTTransformer):
         original_node: cst.FunctionDef,  # noqa: ARG002
         updated_node: cst.FunctionDef,
     ) -> cst.FunctionDef:
-        self._func_depth -= 1
-        if self._func_depth > 0:
+        self._func_stack.pop()
+        if self._func_stack:
             return updated_node
 
         cls_name = self._class_stack[-1] if self._class_stack else None
@@ -114,6 +117,53 @@ class _NarrowingTransformer(cst.CSTTransformer):
             return updated_node
 
         return self._apply_to_function(updated_node, matched)
+
+    def leave_AnnAssign(  # noqa: N802
+        self,
+        original_node: cst.AnnAssign,  # noqa: ARG002
+        updated_node: cst.AnnAssign,
+    ) -> cst.AnnAssign:
+        if not self._class_stack:
+            return updated_node
+        cls_name = self._class_stack[-1]
+        attr_name = self._match_attr_target(updated_node.target)
+        if attr_name is None:
+            return updated_node
+        cand = self._by_attr.get((cls_name, attr_name))
+        if cand is None:
+            return updated_node
+        return self._apply_to_ann_assign(updated_node, cand)
+
+    def _match_attr_target(self, target: cst.BaseAssignTargetExpression) -> str | None:
+        """Return attribute name for class-body `attr: T` or `__init__`'s `self.attr: T`."""
+        if not self._func_stack and isinstance(target, cst.Name):
+            return target.value
+        if (
+            self._func_stack == ["__init__"]
+            and isinstance(target, cst.Attribute)
+            and isinstance(target.value, cst.Name)
+            and target.value.value == "self"
+        ):
+            return target.attr.value
+        return None
+
+    def _apply_to_ann_assign(
+        self,
+        node: cst.AnnAssign,
+        cand: NarrowingCandidate,
+    ) -> cst.AnnAssign:
+        """Rewrite the annotation (and optionally drop `= None`) on an AnnAssign."""
+        new_expr = cst.parse_expression(cand.suggested_type)
+        new_ann = node.annotation.with_changes(annotation=new_expr)
+        if cand.needs_literal_import:
+            self.added_literal = True
+        if cand.drop_none_default and not self._func_stack:
+            return node.with_changes(
+                annotation=new_ann,
+                equal=cst.MaybeSentinel.DEFAULT,
+                value=None,
+            )
+        return node.with_changes(annotation=new_ann)
 
     def _matching_candidates(
         self,
@@ -230,7 +280,6 @@ def _has_literal_import(module: cst.Module) -> bool:
 
 def _insert_literal_import(module: cst.Module) -> cst.Module:
     """Add `Literal` to an existing `from typing import ...` or insert a new import line."""
-    # Try merging into an existing `from typing import ...` statement first.
     new_body = list(module.body)
     for idx, stmt in enumerate(new_body):
         merged = _try_add_literal_to_typing_import(stmt)
@@ -238,7 +287,6 @@ def _insert_literal_import(module: cst.Module) -> cst.Module:
             new_body[idx] = merged
             return module.with_changes(body=new_body)
 
-    # Otherwise insert `from typing import Literal` after docstring and __future__ imports.
     insert_idx = _find_import_insertion_index(new_body)
     import_stmt = cst.parse_statement("from typing import Literal\n")
     new_body.insert(insert_idx, import_stmt)

@@ -16,8 +16,13 @@ class RuleCode(StrEnum):
     NT101 = "NT101"  # Tier 1: Guarded str/int parameter -> Literal[...]
     NT102 = "NT102"  # Tier 1: Return T | None -> T when None is never returned
     NT103 = "NT103"  # Tier 1: Return str/int -> Literal[...] when all returns are literals
+    NT104 = "NT104"  # Tier 1: Always-initialized class attribute T | None -> T
+    NT105 = "NT105"  # Tier 1: Return union A | B | C has unused branch(es)
     NT201 = "NT201"  # Tier 2: Call-site str/int parameter -> Literal[...]
     NT202 = "NT202"  # Tier 2: Call-site T | None parameter -> T
+    NT203 = "NT203"  # Tier 2: Dataclass / NamedTuple field narrowing across call sites
+    NT204 = "NT204"  # Tier 2: Call-site union parameter A | B | C has unused branch(es)
+    NT205 = "NT205"  # Tier 2: Constant bool parameter -> Literal[True] / Literal[False]
 
 
 class Tier(IntEnum):
@@ -32,6 +37,7 @@ class TargetKind(StrEnum):
 
     PARAMETER = "parameter"
     RETURN = "return"
+    ATTRIBUTE = "attribute"
 
 
 class VerificationStatus(StrEnum):
@@ -75,7 +81,7 @@ class CheckerDiagnostic:
 
 @dataclass
 class NarrowingCandidate:
-    """Proposed narrowing of a single parameter or return type annotation."""
+    """Proposed narrowing of a single parameter, return, or attribute type annotation."""
 
     code: RuleCode
     tier: Tier

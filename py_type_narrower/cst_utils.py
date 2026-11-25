@@ -4,11 +4,39 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from typing import Literal as TypingLiteral
 
 import libcst as cst
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 type LiteralScalar = str | int | bool
+
+_BUILTIN_TYPE_CONSTRUCTORS: frozenset[str] = frozenset(
+    {
+        "str",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+        "complex",
+    }
+)
+
+_CONTAINER_ALIASES: dict[str, set[str]] = {
+    "list": {"list", "Sequence", "MutableSequence", "Iterable", "Collection"},
+    "tuple": {"tuple", "Sequence", "Iterable", "Collection"},
+    "set": {"set", "AbstractSet", "MutableSet", "Iterable", "Collection"},
+    "frozenset": {"frozenset", "AbstractSet", "Iterable", "Collection"},
+    "dict": {"dict", "Mapping", "MutableMapping"},
+}
 
 
 @dataclass(frozen=True)
@@ -17,6 +45,13 @@ class ExtractedLiteral:
 
     kind: TypingLiteral["str", "int", "bool"]
     value: LiteralScalar
+
+
+def is_bool_annotation(annotation: cst.Annotation | None) -> bool:
+    """Return True if the annotation is plain `bool` (or `builtins.bool`)."""
+    if annotation is None:
+        return False
+    return _annotation_simple_name(annotation.annotation) in {"bool", "builtins.bool"}
 
 
 def base_primitive_annotation(
@@ -56,27 +91,9 @@ def extract_optional_inner(annotation: cst.Annotation | None) -> str | None:
     return None
 
 
-def extract_literal_values_from_annotation(
-    annotation: cst.Annotation | None,
-) -> tuple[ExtractedLiteral, ...] | None:
-    """Extract literal values if annotation is `Literal[...]` or `typing.Literal[...]`."""
-    if annotation is None:
-        return None
-    expr = annotation.annotation
-    if not isinstance(expr, cst.Subscript):
-        return None
-    base_name = _annotation_simple_name(expr.value)
-    if base_name not in {"Literal", "typing.Literal", "typing_extensions.Literal"}:
-        return None
-    values: list[ExtractedLiteral] = []
-    for elem in expr.slice:
-        if not isinstance(elem.slice, cst.Index):
-            return None
-        lit = extract_literal(elem.slice.value)
-        if lit is None:
-            return None
-        values.append(lit)
-    return tuple(values) if values else None
+def format_union_type(members: Sequence[str]) -> str:
+    """Format one or more union member strings using PEP 604 `|` syntax."""
+    return " | ".join(members)
 
 
 def format_literal_type(values: set[ExtractedLiteral] | list[ExtractedLiteral]) -> str:
@@ -90,7 +107,7 @@ def is_definitely_non_none_expr(expr: cst.BaseExpression) -> bool:
     """Return True if a CST expression is syntactically guaranteed not to evaluate to None."""
     if is_none_expr(expr):
         return False
-    if extract_literal(expr) is not None:
+    if extract_literal(expr) is not None or _is_bytes_literal(expr):
         return True
     non_none_nodes = (
         cst.Float,
@@ -116,6 +133,142 @@ def is_definitely_non_none_expr(expr: cst.BaseExpression) -> bool:
     if isinstance(expr, cst.IfExp):
         return is_definitely_non_none_expr(expr.body) and is_definitely_non_none_expr(expr.orelse)
     return False
+
+
+def infer_simple_expr_type(expr: cst.BaseExpression) -> str | None:
+    """Infer a conservative static type name for simple syntactic expressions."""
+    if is_none_expr(expr):
+        return "None"
+    lit = extract_literal(expr)
+    if lit is not None:
+        return lit.kind
+    if _is_bytes_literal(expr):
+        return "bytes"
+    return _infer_compound_or_call_type(expr)
+
+
+def matches_union_member(
+    observed_type: str,
+    member: str,
+    *,
+    union_has_bool: bool = False,
+) -> bool:
+    """Return True if an observed type name can satisfy a declared union member."""
+    obs = observed_type.strip()
+    mem = member.strip()
+    if obs == mem:
+        return True
+    if obs == "None" or mem == "None":
+        return obs == mem
+
+    obs_base = _strip_type_args(obs)
+    mem_base = _strip_type_args(mem)
+    if obs_base == mem_base or mem_base.rsplit(".", maxsplit=1)[-1] == obs_base:
+        return True
+
+    # In Python, bool is a subtype of int; only match int if bool is not explicitly in the union.
+    if obs_base == "bool" and mem_base == "int" and not union_has_bool:
+        return True
+
+    # Literal[...] satisfies its underlying primitive union branch.
+    if obs.startswith("Literal["):
+        return _literal_type_str_matches(obs, mem_base)
+
+    aliases = _CONTAINER_ALIASES.get(obs_base)
+    return aliases is not None and mem_base.rsplit(".", maxsplit=1)[-1] in aliases
+
+
+_MIN_UNION_MEMBERS = 2
+
+
+def extract_union_members(annotation: cst.Annotation | None) -> tuple[str, ...] | None:
+    """Extract top-level union member strings from `A | B`, `Union[A, B]`, or `Optional[T]`."""
+    if annotation is None:
+        return None
+    expr = annotation.annotation
+    if isinstance(expr, cst.BinaryOperation) and isinstance(expr.operator, cst.BitOr):
+        members = [expr_to_code(m) for m in _flatten_bitor(expr)]
+        return tuple(members) if len(members) >= _MIN_UNION_MEMBERS else None
+    if isinstance(expr, cst.Subscript):
+        return _extract_subscript_union_members(expr)
+    return None
+
+
+def _infer_compound_or_call_type(expr: cst.BaseExpression) -> str | None:
+    """Infer type names for floats, f-strings, container literals, comparisons, and builtin calls."""
+    simple_node_map: tuple[tuple[type[cst.CSTNode] | tuple[type[cst.CSTNode], ...], str], ...] = (
+        (cst.Float, "float"),
+        (cst.Imaginary, "complex"),
+        (cst.FormattedString, "str"),
+        ((cst.List, cst.ListComp), "list"),
+        ((cst.Dict, cst.DictComp), "dict"),
+        ((cst.Set, cst.SetComp), "set"),
+        (cst.Tuple, "tuple"),
+        (cst.Comparison, "bool"),
+    )
+    for node_types, type_name in simple_node_map:
+        if isinstance(expr, node_types):
+            return type_name
+    if isinstance(expr, cst.UnaryOperation) and isinstance(expr.operator, cst.Not):
+        return "bool"
+    if isinstance(expr, cst.Call) and isinstance(expr.func, cst.Name):
+        if expr.func.value in _BUILTIN_TYPE_CONSTRUCTORS:
+            return expr.func.value
+        if expr.func.value == "len":
+            return "int"
+    return None
+
+
+def _is_bytes_literal(expr: cst.BaseExpression) -> bool:
+    """Return True if expr is a bytes literal such as `b'abc'`."""
+    if not isinstance(expr, (cst.SimpleString, cst.ConcatenatedString)):
+        return False
+    try:
+        val = ast.literal_eval(expr_to_code(expr))
+    except (SyntaxError, ValueError):
+        return False
+    return isinstance(val, bytes)
+
+
+def _strip_type_args(type_str: str) -> str:
+    """Return the outer name of a generic type string (e.g. `list[int]` -> `list`)."""
+    bracket = type_str.find("[")
+    return type_str[:bracket].strip() if bracket != -1 else type_str.strip()
+
+
+def _literal_type_str_matches(obs_literal: str, mem_base: str) -> bool:
+    """Check if a `Literal[...]` string matches `str`, `int`, or `bool`."""
+    try:
+        ann = cst.Annotation(annotation=cst.parse_expression(obs_literal))
+    except cst.ParserSyntaxError:
+        return False
+    lits = extract_literal_values_from_annotation(ann)
+    if not lits:
+        return False
+    return any(lit.kind == mem_base for lit in lits)
+
+
+def extract_literal_values_from_annotation(
+    annotation: cst.Annotation | None,
+) -> tuple[ExtractedLiteral, ...] | None:
+    """Extract literal values if annotation is `Literal[...]` or `typing.Literal[...]`."""
+    if annotation is None:
+        return None
+    expr = annotation.annotation
+    if not isinstance(expr, cst.Subscript):
+        return None
+    base_name = _annotation_simple_name(expr.value)
+    if base_name not in {"Literal", "typing.Literal", "typing_extensions.Literal"}:
+        return None
+    values: list[ExtractedLiteral] = []
+    for elem in expr.slice:
+        if not isinstance(elem.slice, cst.Index):
+            return None
+        lit = extract_literal(elem.slice.value)
+        if lit is None:
+            return None
+        values.append(lit)
+    return tuple(values) if values else None
 
 
 def extract_literal(expr: cst.BaseExpression) -> ExtractedLiteral | None:
@@ -192,15 +345,6 @@ def _strip_none_from_subscript_union(expr: cst.Subscript) -> str | None:
     return None
 
 
-def _strip_none_from_optional_subscript(expr: cst.Subscript) -> str | None:
-    """Extract `T` from `Optional[T]`."""
-    if len(expr.slice) == 1 and isinstance(expr.slice[0].slice, cst.Index):
-        inner = expr.slice[0].slice.value
-        if not is_none_expr(inner):
-            return expr_to_code(inner)
-    return None
-
-
 def _strip_none_from_union_subscript(expr: cst.Subscript) -> str | None:
     """Strip `None` from `Union[T, None]`."""
     members: list[cst.BaseExpression] = []
@@ -214,14 +358,20 @@ def _strip_none_from_union_subscript(expr: cst.Subscript) -> str | None:
     return " | ".join(expr_to_code(member) for member in non_none)
 
 
-def expr_to_code(node: cst.CSTNode) -> str:
-    """Render a CST node back to source code."""
-    return cst.Module(body=[]).code_for_node(node).strip()
-
-
-def is_none_expr(expr: cst.BaseExpression) -> bool:
-    """Return True if the CST expression is the literal `None`."""
-    return isinstance(expr, cst.Name) and expr.value == "None"
+def _extract_subscript_union_members(expr: cst.Subscript) -> tuple[str, ...] | None:
+    """Extract member type strings from `Optional[T]` or `Union[A, B, ...]`."""
+    base_name = _annotation_simple_name(expr.value)
+    if base_name in {"Optional", "typing.Optional"}:
+        inner = _strip_none_from_optional_subscript(expr)
+        return (inner, "None") if inner is not None else None
+    if base_name in {"Union", "typing.Union"}:
+        members: list[str] = []
+        for elem in expr.slice:
+            if not isinstance(elem.slice, cst.Index):
+                return None
+            members.append(expr_to_code(elem.slice.value))
+        return tuple(members) if len(members) >= _MIN_UNION_MEMBERS else None
+    return None
 
 
 def _annotation_simple_name(expr: cst.BaseExpression) -> str | None:
@@ -233,6 +383,25 @@ def _annotation_simple_name(expr: cst.BaseExpression) -> str | None:
         if prefix is not None:
             return f"{prefix}.{expr.attr.value}"
     return None
+
+
+def _strip_none_from_optional_subscript(expr: cst.Subscript) -> str | None:
+    """Extract `T` from `Optional[T]`."""
+    if len(expr.slice) == 1 and isinstance(expr.slice[0].slice, cst.Index):
+        inner = expr.slice[0].slice.value
+        if not is_none_expr(inner):
+            return expr_to_code(inner)
+    return None
+
+
+def expr_to_code(node: cst.CSTNode) -> str:
+    """Render a CST node back to source code."""
+    return cst.Module(body=[]).code_for_node(node).strip()
+
+
+def is_none_expr(expr: cst.BaseExpression) -> bool:
+    """Return True if the CST expression is the literal `None`."""
+    return isinstance(expr, cst.Name) and expr.value == "None"
 
 
 def _literal_sort_key(lit: ExtractedLiteral) -> tuple[int, str | int]:

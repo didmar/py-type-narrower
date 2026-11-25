@@ -15,6 +15,7 @@ from py_type_narrower.body_analysis import (
     analyze_function_body,
     extract_module_const_dicts,
 )
+from py_type_narrower.class_analysis import ClassAttrFact, analyze_class_attributes
 from py_type_narrower.cst_utils import (
     ExtractedLiteral,
     base_primitive_annotation,
@@ -22,6 +23,9 @@ from py_type_narrower.cst_utils import (
     extract_literal,
     extract_literal_values_from_annotation,
     extract_optional_inner,
+    extract_union_members,
+    infer_simple_expr_type,
+    is_bool_annotation,
     is_definitely_non_none_expr,
     is_none_expr,
 )
@@ -32,6 +36,7 @@ logger = logging.getLogger(__name__)
 ABSTRACT_BASE_NAMES: frozenset[str] = frozenset(
     {"ABC", "Protocol", "abc.ABC", "typing.Protocol", "typing_extensions.Protocol"}
 )
+NAMEDTUPLE_BASE_NAMES: frozenset[str] = frozenset({"NamedTuple", "typing.NamedTuple"})
 
 
 @dataclass
@@ -49,6 +54,25 @@ class ParamInfo:
     default_is_none: bool
     default_literal: ExtractedLiteral | None
     kind: TypingLiteral["posonly", "regular", "kwonly"]
+    is_bool: bool = False
+    union_members: tuple[str, ...] | None = None
+    default_type: str | None = None
+
+
+@dataclass
+class FieldInfo:
+    """Indexed metadata for a dataclass or NamedTuple field."""
+
+    name: str
+    line: int
+    col: int
+    annotation_str: str
+    primitive_kind: TypingLiteral["str", "int"] | None
+    optional_inner: str | None
+    has_default: bool
+    default_is_none: bool
+    default_literal: ExtractedLiteral | None
+    is_kw_only: bool = False
 
 
 @dataclass
@@ -79,11 +103,12 @@ class FunctionInfo:
     return_line: int
     return_col: int
     body_facts: BodyFacts
+    return_union_members: tuple[str, ...] | None = None
 
 
 @dataclass
 class ObservedArg:
-    """Single observed argument passed to a parameter at a call site."""
+    """Single observed argument passed to a parameter or field at a call/write site."""
 
     file: Path
     line: int
@@ -92,11 +117,12 @@ class ObservedArg:
     is_non_none: bool = False
     literals: tuple[ExtractedLiteral, ...] | None = None
     is_unknown: bool = False
+    observed_type: str | None = None
 
 
 @dataclass
 class ParamCallStats:
-    """Aggregated call-site observations for one parameter of a function."""
+    """Aggregated call-site observations for one parameter or dataclass field."""
 
     observations: list[ObservedArg] = field(default_factory=list)
     omitted_count: int = 0
@@ -105,14 +131,24 @@ class ParamCallStats:
 
 @dataclass
 class ClassInfo:
-    """Indexed class hierarchy information."""
+    """Indexed class hierarchy, fields, and local attribute facts."""
 
     qualname: str
     name: str
     module_name: str
     bases: list[str]
+    file: Path
+    line: int
+    col: int
+    is_private: bool = False
+    is_test_file: bool = False
     methods: set[str] = field(default_factory=set)
     is_protocol_or_abc: bool = False
+    is_dataclass: bool = False
+    is_namedtuple: bool = False
+    is_kw_only_dataclass: bool = False
+    fields: list[FieldInfo] = field(default_factory=list)
+    attr_facts: list[ClassAttrFact] = field(default_factory=list)
 
 
 @dataclass
@@ -124,6 +160,7 @@ class RepoIndex:
     functions: dict[str, FunctionInfo] = field(default_factory=dict)
     classes: dict[str, ClassInfo] = field(default_factory=dict)
     call_stats: dict[tuple[str, str], ParamCallStats] = field(default_factory=dict)
+    field_stats: dict[tuple[str, str], ParamCallStats] = field(default_factory=dict)
 
 
 @dataclass
@@ -305,21 +342,123 @@ class _DefinitionCollector(cst.CSTVisitor):
         self._func_depth = 0
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: N802
+        pos = self.get_metadata(PositionProvider, node.name)
         bases = [expr_to_code(arg.value) for arg in node.bases]
         is_proto_abc = any(base in ABSTRACT_BASE_NAMES for base in bases)
+        is_dataclass, is_kw_only_dc = _inspect_dataclass_decorator(node)
+        is_namedtuple = any(base in NAMEDTUPLE_BASE_NAMES for base in bases)
         prefix = ".".join(c.name for c in self._class_stack)
         cls_name = f"{prefix}.{node.name.value}" if prefix else node.name.value
         qualname = f"{self.module_name}.{cls_name}"
+        is_private = _is_symbol_private(
+            node.name.value,
+            class_name=None,
+            exported_all=self.exported_all,
+            in_nested_function=self._func_depth > 0,
+        )
+        fields = (
+            self._extract_structured_fields(node, is_kw_only_dc=is_kw_only_dc)
+            if (is_dataclass or is_namedtuple)
+            else []
+        )
+        attr_facts = (
+            analyze_class_attributes(node, self.known_class_names, self._node_position)
+            if not (is_proto_abc or is_dataclass or is_namedtuple)
+            else []
+        )
         cls_info = ClassInfo(
             qualname=qualname,
             name=node.name.value,
             module_name=self.module_name,
             bases=bases,
+            file=self.file,
+            line=pos.start.line,
+            col=pos.start.column,
+            is_private=is_private,
+            is_test_file=self.is_test_file,
             is_protocol_or_abc=is_proto_abc,
+            is_dataclass=is_dataclass,
+            is_namedtuple=is_namedtuple,
+            is_kw_only_dataclass=is_kw_only_dc,
+            fields=fields,
+            attr_facts=attr_facts,
         )
         self.index.classes[qualname] = cls_info
         self._class_stack.append(cls_info)
         return True
+
+    def _node_position(self, node: cst.CSTNode) -> tuple[int, int]:
+        """Return 1-based line and 0-based column for a CST node."""
+        pos = self.get_metadata(PositionProvider, node)
+        return (pos.start.line, pos.start.column)
+
+    def _extract_structured_fields(
+        self,
+        cls_node: cst.ClassDef,
+        *,
+        is_kw_only_dc: bool,
+    ) -> list[FieldInfo]:
+        """Extract dataclass / NamedTuple fields from class body annotations."""
+        if not isinstance(cls_node.body, cst.IndentedBlock):
+            return []
+        fields: list[FieldInfo] = []
+        kw_only_active = is_kw_only_dc
+        for stmt in cls_node.body.body:
+            if not isinstance(stmt, cst.SimpleStatementLine):
+                continue
+            for small in stmt.body:
+                if not isinstance(small, cst.AnnAssign) or not isinstance(small.target, cst.Name):
+                    continue
+                ann_str = expr_to_code(small.annotation.annotation)
+                if ann_str in {"KW_ONLY", "dataclasses.KW_ONLY"}:
+                    kw_only_active = True
+                    continue
+                if ann_str.startswith(("ClassVar", "typing.ClassVar")):
+                    continue
+                field_info = self._build_field_info(small, ann_str, kw_only_active=kw_only_active)
+                if field_info is not None:
+                    fields.append(field_info)
+        return fields
+
+    def _build_field_info(
+        self,
+        stmt: cst.AnnAssign,
+        ann_str: str,
+        *,
+        kw_only_active: bool,
+    ) -> FieldInfo | None:
+        """Build a FieldInfo from a single class-body AnnAssign, skipping init=False fields."""
+        if not isinstance(stmt.target, cst.Name):
+            return None
+        val = stmt.value
+        field_kw_only = kw_only_active
+        has_default = val is not None
+        default_is_none = False
+        default_lit: ExtractedLiteral | None = None
+
+        if val is not None and _is_dataclass_field_call(val):
+            init_flag, dc_has_default, dc_kw_only = _parse_dataclass_field_call(val)
+            if not init_flag:
+                return None
+            has_default = dc_has_default
+            field_kw_only = field_kw_only or dc_kw_only
+        elif val is not None:
+            default_is_none = is_none_expr(val)
+            default_lit = extract_literal(val)
+
+        pos = self.get_metadata(PositionProvider, stmt.target)
+        return FieldInfo(
+            name=stmt.target.value,
+            line=pos.start.line,
+            col=pos.start.column,
+            annotation_str=ann_str,
+            primitive_kind=base_primitive_annotation(stmt.annotation),
+            optional_inner=extract_optional_inner(stmt.annotation),
+            has_default=has_default,
+            default_is_none=default_is_none,
+            default_literal=default_lit,
+            is_kw_only=field_kw_only,
+        )
 
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: ARG002, N802
         self._class_stack.pop()
@@ -351,11 +490,13 @@ class _DefinitionCollector(cst.CSTVisitor):
             and p.optional_inner is None
             and p.annotation_str != "None"
         }
+        param_types = {p.name: p.annotation_str for p in params if p.annotation_str is not None}
         body_facts = analyze_function_body(
             node,
             param_non_none_names=param_non_none,
             module_const_dicts=self.const_dicts,
             known_class_names=self.known_class_names,
+            param_types=param_types,
         )
 
         ret_pos = (
@@ -391,6 +532,7 @@ class _DefinitionCollector(cst.CSTVisitor):
             return_line=ret_pos.start.line,
             return_col=ret_pos.start.column,
             body_facts=body_facts,
+            return_union_members=extract_union_members(node.returns),
         )
         self.index.functions[qualname] = info
         return True
@@ -427,6 +569,11 @@ class _DefinitionCollector(cst.CSTVisitor):
                         default_is_none=default is not None and is_none_expr(default),
                         default_literal=extract_literal(default) if default is not None else None,
                         kind=kind,
+                        is_bool=is_bool_annotation(p.annotation),
+                        union_members=extract_union_members(p.annotation),
+                        default_type=infer_simple_expr_type(default)
+                        if default is not None
+                        else None,
                     )
                 )
         return result
@@ -643,6 +790,59 @@ class _LocalVarBinding:
     literals: tuple[ExtractedLiteral, ...] | None = None
     is_non_none: bool = False
     class_type: str | None = None
+    inferred_type: str | None = None
+
+
+def _inspect_dataclass_decorator(node: cst.ClassDef) -> tuple[bool, bool]:
+    """Return `(is_dataclass, is_kw_only)` from class decorators."""
+    for dec in node.decorators:
+        expr = dec.decorator
+        kw_only = False
+        if isinstance(expr, cst.Call):
+            for arg in expr.args:
+                if (
+                    arg.keyword is not None
+                    and arg.keyword.value == "kw_only"
+                    and isinstance(arg.value, cst.Name)
+                    and arg.value.value == "True"
+                ):
+                    kw_only = True
+            expr = expr.func
+        code = expr_to_code(expr)
+        if (
+            code in {"dataclass", "dataclasses.dataclass"}
+            or code.rsplit(".", maxsplit=1)[-1] == "dataclass"
+        ):
+            return (True, kw_only)
+    return (False, False)
+
+
+def _is_dataclass_field_call(expr: cst.BaseExpression) -> bool:
+    """Return True if expr is a `field(...)` or `dataclasses.field(...)` call."""
+    if not isinstance(expr, cst.Call):
+        return False
+    code = expr_to_code(expr.func)
+    return code in {"field", "dataclasses.field"}
+
+
+def _parse_dataclass_field_call(expr: cst.BaseExpression) -> tuple[bool, bool, bool]:
+    """Parse `(init, has_default, kw_only)` from a `dataclasses.field(...)` call."""
+    if not isinstance(expr, cst.Call):
+        return (True, False, False)
+    init_flag = True
+    has_default = False
+    kw_only = False
+    for arg in expr.args:
+        if arg.keyword is None:
+            continue
+        kw = arg.keyword.value
+        if kw == "init" and isinstance(arg.value, cst.Name) and arg.value.value == "False":
+            init_flag = False
+        elif kw in {"default", "default_factory"}:
+            has_default = True
+        elif kw == "kw_only" and isinstance(arg.value, cst.Name) and arg.value.value == "True":
+            kw_only = True
+    return (init_flag, has_default, kw_only)
 
 
 class _CallSiteCollector(cst.CSTVisitor):
@@ -676,6 +876,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                 literals=lits,
                 is_non_none=is_non_none,
                 class_type=ann_str,
+                inferred_type=ann_str,
             )
         self._scope_stack.append(scope)
         return True
@@ -684,9 +885,12 @@ class _CallSiteCollector(cst.CSTVisitor):
         self._scope_stack.pop()
 
     def visit_Assign(self, node: cst.Assign) -> bool:  # noqa: N802
-        if len(node.targets) == 1 and isinstance(node.targets[0].target, cst.Name):
-            var_name = node.targets[0].target.value
-            self._record_var_value(var_name, node.value, annotation=None)
+        if len(node.targets) == 1:
+            target = node.targets[0].target
+            if isinstance(target, cst.Name):
+                self._record_var_value(target.value, node.value, annotation=None)
+            elif isinstance(target, cst.Attribute):
+                self._record_attr_write(target, node.value)
         return True
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> bool:  # noqa: N802
@@ -703,15 +907,112 @@ class _CallSiteCollector(cst.CSTVisitor):
                     literals=None,
                     is_non_none=existing.is_non_none,
                     class_type=existing.class_type,
+                    inferred_type=existing.inferred_type,
                 )
         return True
 
     def visit_Call(self, node: cst.Call) -> bool:  # noqa: N802
+        pos = self.get_metadata(PositionProvider, node)
         target_fn, is_bound_call = self._resolve_call_target(node.func)
         if target_fn is not None:
-            pos = self.get_metadata(PositionProvider, node)
             self._bind_call_arguments(target_fn, node, pos.start.line, is_bound=is_bound_call)
+            return True
+
+        target_cls = self._resolve_structured_class_target(node.func)
+        if target_cls is not None:
+            self._bind_field_arguments(target_cls, node, pos.start.line)
         return True
+
+    def _record_attr_write(self, target: cst.Attribute, value: cst.BaseExpression) -> None:
+        """Record `obj.field = value` writes against indexed dataclass fields."""
+        if not isinstance(target.value, cst.Name):
+            return
+        receiver = target.value.value
+        cls_info = self._resolve_receiver_class(receiver)
+        if cls_info is None or not (cls_info.is_dataclass or cls_info.is_namedtuple):
+            return
+        field_name = target.attr.value
+        if any(f.name == field_name for f in cls_info.fields):
+            pos = self.get_metadata(PositionProvider, target)
+            stats = self.index.field_stats.setdefault(
+                (cls_info.qualname, field_name), ParamCallStats()
+            )
+            stats.observations.append(self._classify_arg_expr(value, pos.start.line))
+
+    def _resolve_receiver_class(self, receiver: str) -> ClassInfo | None:
+        """Resolve `self` or a typed local variable to its ClassInfo if indexed."""
+        if receiver == "self" and self._class_stack:
+            qual = f"{self.ctx.module_name}.{self._class_stack[-1]}"
+            return self.index.classes.get(qual)
+        binding = self._lookup_local_var(receiver)
+        if binding is None or binding.class_type is None:
+            return None
+        return self._lookup_class_by_ref(binding.class_type)
+
+    def _lookup_class_by_ref(self, class_ref: str) -> ClassInfo | None:
+        """Resolve a class name in current module or imports to a ClassInfo."""
+        for qual in (f"{self.ctx.module_name}.{class_ref}", self.ctx.imports.get(class_ref, "")):
+            if qual in self.index.classes:
+                return self.index.classes[qual]
+        return None
+
+    def _resolve_structured_class_target(self, func_expr: cst.BaseExpression) -> ClassInfo | None:
+        """Resolve a constructor call `MyDataclass(...)` or `mod.MyDataclass(...)`."""
+        candidates: list[str] = []
+        if isinstance(func_expr, cst.Name):
+            candidates.append(f"{self.ctx.module_name}.{func_expr.value}")
+            imported = self.ctx.imports.get(func_expr.value)
+            if imported:
+                candidates.append(imported)
+        elif isinstance(func_expr, cst.Attribute) and isinstance(func_expr.value, cst.Name):
+            mod = self.ctx.module_imports.get(func_expr.value.value)
+            if mod:
+                candidates.append(f"{mod}.{func_expr.attr.value}")
+        for qual in candidates:
+            cls = self.index.classes.get(qual)
+            if cls is not None and (cls.is_dataclass or cls.is_namedtuple) and cls.fields:
+                return cls
+        return None
+
+    def _bind_field_arguments(self, target: ClassInfo, call: cst.Call, line: int) -> None:
+        """Bind constructor call arguments onto dataclass / NamedTuple fields."""
+        fields = target.fields
+        pos_fields = [f for f in fields if not f.is_kw_only]
+        by_name = {f.name: f for f in fields}
+        if any(arg.star in {"*", "**"} for arg in call.args):
+            for f in fields:
+                stats = self.index.field_stats.setdefault(
+                    (target.qualname, f.name), ParamCallStats()
+                )
+                stats.has_dynamic_star_call = True
+            return
+
+        bound: set[str] = set()
+        pos_idx = 0
+        for arg in call.args:
+            if arg.keyword is not None:
+                kw_name = arg.keyword.value
+                if kw_name in by_name:
+                    bound.add(kw_name)
+                    stats = self.index.field_stats.setdefault(
+                        (target.qualname, kw_name), ParamCallStats()
+                    )
+                    stats.observations.append(self._classify_arg_expr(arg.value, line))
+            elif pos_idx < len(pos_fields):
+                fld = pos_fields[pos_idx]
+                pos_idx += 1
+                bound.add(fld.name)
+                stats = self.index.field_stats.setdefault(
+                    (target.qualname, fld.name), ParamCallStats()
+                )
+                stats.observations.append(self._classify_arg_expr(arg.value, line))
+
+        for fld in fields:
+            if fld.name not in bound:
+                stats = self.index.field_stats.setdefault(
+                    (target.qualname, fld.name), ParamCallStats()
+                )
+                stats.omitted_count += 1
 
     def _record_var_value(
         self,
@@ -730,6 +1031,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         )
         val_lit = extract_literal(value) if value is not None else None
         val_non_none = value is not None and is_definitely_non_none_expr(value)
+        val_type = infer_simple_expr_type(value) if value is not None else None
 
         class_type = ann_str
         if (
@@ -740,18 +1042,25 @@ class _CallSiteCollector(cst.CSTVisitor):
             and isinstance(value.func, cst.Name)
         ):
             class_type = value.func.value
+            val_type = value.func.value
             val_non_none = True
 
+        inferred_type = ann_str or val_type
         existing = scope.get(var_name)
         if existing is not None:
-            # Conservative on reassignment: drop literal certainty if reassigned differently.
             merged_lits = ann_lits or (
                 (val_lit,) if val_lit is not None and existing.literals == (val_lit,) else None
+            )
+            merged_type = (
+                inferred_type
+                if (inferred_type is not None and existing.inferred_type == inferred_type)
+                else None
             )
             scope[var_name] = _LocalVarBinding(
                 literals=merged_lits,
                 is_non_none=existing.is_non_none and (ann_non_none or val_non_none),
                 class_type=class_type or existing.class_type,
+                inferred_type=merged_type,
             )
             return
 
@@ -760,6 +1069,7 @@ class _CallSiteCollector(cst.CSTVisitor):
             literals=lits,
             is_non_none=ann_non_none or val_non_none,
             class_type=class_type,
+            inferred_type=inferred_type,
         )
 
     def _resolve_call_target(
@@ -904,29 +1214,93 @@ class _CallSiteCollector(cst.CSTVisitor):
     def _classify_arg_expr(self, expr: cst.BaseExpression, line: int) -> ObservedArg:
         """Classify a call-site argument expression as None, literal(s), non-None, or unknown."""
         if is_none_expr(expr):
-            return self._make_obs(line, is_none=True, is_non_none=False)
+            return ObservedArg(
+                file=self.ctx.file,
+                line=line,
+                is_test_caller=self.ctx.is_test_file,
+                is_none=True,
+                is_non_none=False,
+                observed_type="None",
+            )
 
         lit = extract_literal(expr)
         if lit is not None:
-            return self._make_obs(line, is_non_none=True, literals=(lit,))
+            return ObservedArg(
+                file=self.ctx.file,
+                line=line,
+                is_test_caller=self.ctx.is_test_file,
+                is_non_none=True,
+                literals=(lit,),
+                observed_type=lit.kind,
+            )
 
         if isinstance(expr, cst.Name):
             return self._classify_name_arg(expr.value, line)
 
-        if is_definitely_non_none_expr(expr) or self._is_known_class_ctor_call(expr):
-            return self._make_obs(line, is_non_none=True, is_unknown=True)
+        inferred = infer_simple_expr_type(expr)
+        if (
+            inferred is None
+            and self._is_known_class_ctor_call(expr)
+            and isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+        ):
+            inferred = expr.func.value
 
-        return self._make_obs(line, is_unknown=True)
+        if is_definitely_non_none_expr(expr) or self._is_known_class_ctor_call(expr):
+            return ObservedArg(
+                file=self.ctx.file,
+                line=line,
+                is_test_caller=self.ctx.is_test_file,
+                is_non_none=True,
+                is_unknown=True,
+                observed_type=inferred,
+            )
+
+        return ObservedArg(
+            file=self.ctx.file,
+            line=line,
+            is_test_caller=self.ctx.is_test_file,
+            is_unknown=True,
+            observed_type=inferred,
+        )
 
     def _classify_name_arg(self, name: str, line: int) -> ObservedArg:
         """Classify a bare variable name argument using local scope bindings."""
         binding = self._lookup_local_var(name)
         if binding is not None:
             if binding.literals is not None:
-                return self._make_obs(line, is_non_none=True, literals=binding.literals)
+                obs_type = binding.inferred_type or binding.literals[0].kind
+                return ObservedArg(
+                    file=self.ctx.file,
+                    line=line,
+                    is_test_caller=self.ctx.is_test_file,
+                    is_non_none=True,
+                    literals=binding.literals,
+                    observed_type=obs_type,
+                )
             if binding.is_non_none:
-                return self._make_obs(line, is_non_none=True, is_unknown=True)
-        return self._make_obs(line, is_unknown=True)
+                return ObservedArg(
+                    file=self.ctx.file,
+                    line=line,
+                    is_test_caller=self.ctx.is_test_file,
+                    is_non_none=True,
+                    is_unknown=True,
+                    observed_type=binding.inferred_type,
+                )
+            if binding.inferred_type is not None:
+                return ObservedArg(
+                    file=self.ctx.file,
+                    line=line,
+                    is_test_caller=self.ctx.is_test_file,
+                    is_unknown=True,
+                    observed_type=binding.inferred_type,
+                )
+        return ObservedArg(
+            file=self.ctx.file,
+            line=line,
+            is_test_caller=self.ctx.is_test_file,
+            is_unknown=True,
+        )
 
     def _is_known_class_ctor_call(self, expr: cst.BaseExpression) -> bool:
         """Return True if expr is a direct call to an indexed class constructor."""
@@ -937,26 +1311,6 @@ class _CallSiteCollector(cst.CSTVisitor):
             self.ctx.imports.get(expr.func.value, ""),
         }
         return any(c in self.index.classes for c in cls_candidates)
-
-    def _make_obs(
-        self,
-        line: int,
-        *,
-        is_none: bool = False,
-        is_non_none: bool = False,
-        literals: tuple[ExtractedLiteral, ...] | None = None,
-        is_unknown: bool = False,
-    ) -> ObservedArg:
-        """Construct an ObservedArg bound to the current module context."""
-        return ObservedArg(
-            file=self.ctx.file,
-            line=line,
-            is_test_caller=self.ctx.is_test_file,
-            is_none=is_none,
-            is_non_none=is_non_none,
-            literals=literals,
-            is_unknown=is_unknown,
-        )
 
 
 def _collect_module_calls(ctx: _ModuleContext, index: RepoIndex) -> None:
