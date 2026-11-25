@@ -352,3 +352,19 @@ class SubNode(BaseNode):
     assert ("leave_node", RuleCode.NT105) not in by_sym
     # Private non-overridden helper on the base class is still narrowed cleanly.
     assert ("_private_non_overridden", RuleCode.NT102) in by_sym
+
+
+def test_hard_negative_getattr_dunders_skipped(tmp_path: Path) -> None:
+    code = """def __getattr__(name: str) -> str:
+    if name == "__version__":
+        return "1.0"
+    raise AttributeError(name)
+
+class ReadOnlyList:
+    def __getattr__(self, key: str) -> object:
+        if key in ("append", "clear"):
+            raise RuntimeError(key)
+        raise AttributeError(key)
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2)
+    assert cands == []

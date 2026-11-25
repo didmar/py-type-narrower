@@ -74,10 +74,17 @@ DATA_MODEL_DUNDER_METHODS: frozenset[str] = frozenset(
         "__ge__",
         "__contains__",
         "__dir__",
+        "__getattr__",
+        "__getattribute__",
+        "__setattr__",
+        "__delattr__",
         "__sizeof__",
         "__fspath__",
     }
 )
+
+# PEP 562 module-level protocol hooks with fixed runtime signatures.
+MODULE_DUNDER_FUNCTIONS: frozenset[str] = frozenset({"__getattr__", "__dir__"})
 
 
 def run_rules(index: RepoIndex, config: NarrowerConfig) -> list[NarrowingCandidate]:
@@ -1045,8 +1052,10 @@ def _skip_return_narrowing_for_protocol(func: FunctionInfo, config: NarrowerConf
 
 
 def _is_data_model_dunder(func: FunctionInfo) -> bool:
-    """Return True if func is a fixed Python data-model protocol method."""
-    return func.is_method and func.name in DATA_MODEL_DUNDER_METHODS
+    """Return True if func is a fixed Python data-model method or PEP 562 module hook."""
+    if func.is_method:
+        return func.name in DATA_MODEL_DUNDER_METHODS
+    return func.name in MODULE_DUNDER_FUNCTIONS
 
 
 def _non_receiver_params(func: FunctionInfo) -> list[ParamInfo]:
