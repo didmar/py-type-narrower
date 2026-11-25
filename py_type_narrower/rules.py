@@ -38,6 +38,8 @@ from py_type_narrower.scorer import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
         ClassInfo,
@@ -47,6 +49,12 @@ if TYPE_CHECKING:
         ParamInfo,
         RepoIndex,
     )
+
+    Tier1FunctionRule = Callable[[FunctionInfo, NarrowerConfig], list[NarrowingCandidate]]
+    Tier2ParamRule = Callable[
+        [FunctionInfo, ParamInfo, ParamCallStats, NarrowerConfig],
+        NarrowingCandidate | None,
+    ]
 
 # Python data-model protocol methods whose signatures are fixed by the runtime/typeshed.
 # User-defined API dunders like __init__, __call__, and __getitem__ are intentionally excluded.
@@ -116,7 +124,7 @@ def _evaluate_function_rules(
     if config.max_tier >= Tier.LOCAL:
         _run_tier1_function_rules(func, config, active, out)
     if config.max_tier >= Tier.WHOLE_REPO:
-        _run_tier2_function_rules(func, index, config, out)
+        _run_tier2_function_rules(func, index, config, active, out)
 
 
 def _evaluate_class_rules(
@@ -139,31 +147,32 @@ def _run_tier1_function_rules(
     active: set[RuleCode],
     out: list[NarrowingCandidate],
 ) -> None:
-    """Evaluate local high-confidence function rules (NT101, NT102, NT103, NT105)."""
-    if RuleCode.NT101 in active:
-        out.extend(_rule_nt101_guarded_params(func, config))
-
-    nt105_cand = _rule_nt105_unused_union_return(func, config) if RuleCode.NT105 in active else None
-    if nt105_cand is not None:
-        out.append(nt105_cand)
-    elif RuleCode.NT102 in active:
-        cand = _rule_nt102_unused_optional_return(func, config)
-        if cand is not None:
-            out.append(cand)
-
-    if RuleCode.NT103 in active:
-        cand = _rule_nt103_literal_return(func, config)
-        if cand is not None:
-            out.append(cand)
+    """Evaluate local high-confidence function rules in priority order (NT101, NT105, NT102, NT103)."""
+    rules: tuple[tuple[RuleCode, Tier1FunctionRule], ...] = (
+        (RuleCode.NT101, _rule_nt101_guarded_params),
+        (RuleCode.NT105, _rule_nt105_unused_union_return),
+        (RuleCode.NT102, _rule_nt102_unused_optional_return),
+        (RuleCode.NT103, _rule_nt103_literal_return),
+    )
+    seen_targets: set[tuple[TargetKind, str | None]] = set()
+    for code, rule_fn in rules:
+        if code not in active:
+            continue
+        for cand in rule_fn(func, config):
+            target = (cand.target_kind, cand.target_name)
+            if target not in seen_targets:
+                seen_targets.add(target)
+                out.append(cand)
 
 
 def _run_tier2_function_rules(
     func: FunctionInfo,
     index: RepoIndex,
     config: NarrowerConfig,
+    active: set[RuleCode],
     out: list[NarrowingCandidate],
 ) -> None:
-    """Evaluate whole-repo call-site function rules (NT201, NT202, NT204, NT205)."""
+    """Evaluate whole-repo call-site function rules (NT201, NT204, NT202, NT205)."""
     if _skip_param_narrowing_for_hierarchy(func):
         return
     if func.in_external_subclass and not func.is_private and func.name != "__init__":
@@ -172,10 +181,14 @@ def _run_tier2_function_rules(
         c.target_name for c in out if c.symbol == func.qualname and c.code == RuleCode.NT101
     }
     for param in _non_receiver_params(func):
+        if param.name in nt101_params:
+            continue
         stats = index.call_stats.get((func.qualname, param.name))
         if stats is None or not stats.observations or stats.has_dynamic_star_call:
             continue
-        out.extend(_evaluate_param_tier2(func, param, stats, config, nt101_params))
+        cand = _evaluate_param_tier2(func, param, stats, config, active)
+        if cand is not None:
+            out.append(cand)
 
 
 def _evaluate_param_tier2(
@@ -183,33 +196,22 @@ def _evaluate_param_tier2(
     param: ParamInfo,
     stats: ParamCallStats,
     config: NarrowerConfig,
-    nt101_params: set[str | None],
-) -> list[NarrowingCandidate]:
-    """Evaluate NT201, NT204/NT202, and NT205 on a single parameter."""
-    active = config.active_rules()
-    found: list[NarrowingCandidate] = []
-    if RuleCode.NT201 in active and param.name not in nt101_params:
-        cand = _rule_nt201_callsite_literal(func, param, stats, config)
-        if cand is not None:
-            found.append(cand)
-
-    nt204_cand = (
-        _rule_nt204_unused_union_param(func, param, stats, config)
-        if RuleCode.NT204 in active
-        else None
+    active: set[RuleCode],
+) -> NarrowingCandidate | None:
+    """Evaluate Tier 2 parameter rules in priority order (NT201, NT204, NT202, NT205)."""
+    rules: tuple[tuple[RuleCode, Tier2ParamRule], ...] = (
+        (RuleCode.NT201, _rule_nt201_callsite_literal),
+        (RuleCode.NT204, _rule_nt204_unused_union_param),
+        (RuleCode.NT202, _rule_nt202_unused_optional_param),
+        (RuleCode.NT205, _rule_nt205_constant_bool_param),
     )
-    if nt204_cand is not None:
-        found.append(nt204_cand)
-    elif RuleCode.NT202 in active:
-        cand = _rule_nt202_unused_optional_param(func, param, stats, config)
+    for code, rule_fn in rules:
+        if code not in active:
+            continue
+        cand = rule_fn(func, param, stats, config)
         if cand is not None:
-            found.append(cand)
-
-    if RuleCode.NT205 in active:
-        cand = _rule_nt205_constant_bool_param(func, param, stats, config)
-        if cand is not None:
-            found.append(cand)
-    return found
+            return cand
+    return None
 
 
 def _rule_nt101_guarded_params(
@@ -270,53 +272,55 @@ def _rule_nt101_guarded_params(
 def _rule_nt102_unused_optional_return(
     func: FunctionInfo,
     config: NarrowerConfig,
-) -> NarrowingCandidate | None:
+) -> list[NarrowingCandidate]:
     """NT102: Return type `T | None` never returns `None` along any path."""
     if (
         func.return_optional_inner is None
         or func.return_annotation_str is None
         or _skip_return_narrowing_for_protocol(func, config)
     ):
-        return None
+        return []
     ret = func.body_facts.returns
     if ret.is_stub or ret.is_generator or not ret.has_returns:
-        return None
+        return []
     if ret.returns_none or ret.can_fallthrough or not ret.all_returns_non_none:
-        return None
+        return []
 
-    return NarrowingCandidate(
-        code=RuleCode.NT102,
-        tier=Tier.LOCAL,
-        file=func.file,
-        line=func.return_line,
-        col=func.return_col,
-        symbol=func.qualname,
-        target_kind=TargetKind.RETURN,
-        target_name=None,
-        current_type=func.return_annotation_str,
-        suggested_type=func.return_optional_inner,
-        needs_literal_import=False,
-        message=(
-            f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
-            f"but all return paths are non-None; narrow to `{func.return_optional_inner}`"
-        ),
-        evidence=[
-            EvidenceItem(
-                kind="return_analysis",
-                detail="All return statements return non-None values and control flow cannot fall through",
-                file=func.file,
-                line=func.line,
-            )
-        ],
-        score=score_tier1_unused_optional_return(is_private=func.is_private),
-        is_public=not func.is_private,
-    )
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT102,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=func.return_optional_inner,
+            needs_literal_import=False,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but all return paths are non-None; narrow to `{func.return_optional_inner}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="return_analysis",
+                    detail="All return statements return non-None values and control flow cannot fall through",
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_unused_optional_return(is_private=func.is_private),
+            is_public=not func.is_private,
+        )
+    ]
 
 
 def _rule_nt103_literal_return(
     func: FunctionInfo,
     config: NarrowerConfig,
-) -> NarrowingCandidate | None:
+) -> list[NarrowingCandidate]:
     """NT103: Return type `str`/`int` only returns constant literals."""
     ret = func.body_facts.returns
     if (
@@ -325,7 +329,7 @@ def _rule_nt103_literal_return(
         or func.is_override
         or _skip_return_narrowing_for_protocol(func, config)
     ):
-        return None
+        return []
     if (
         ret.is_stub
         or ret.is_generator
@@ -334,7 +338,7 @@ def _rule_nt103_literal_return(
         or ret.has_non_literal_return
         or not ret.returned_literals
     ):
-        return None
+        return []
 
     matching = filter_literals_by_kind(ret.returned_literals, func.return_primitive_kind)
     if (
@@ -343,41 +347,43 @@ def _rule_nt103_literal_return(
         or len(matching) > config.max_literals
         or _has_prose_or_overlong_literal(matching)
     ):
-        return None
+        return []
     if len(matching) == 1 and func.in_external_subclass and not func.is_private:
-        return None
+        return []
 
     suggested = format_literal_type(matching)
-    return NarrowingCandidate(
-        code=RuleCode.NT103,
-        tier=Tier.LOCAL,
-        file=func.file,
-        line=func.return_line,
-        col=func.return_col,
-        symbol=func.qualname,
-        target_kind=TargetKind.RETURN,
-        target_name=None,
-        current_type=func.return_annotation_str,
-        suggested_type=suggested,
-        needs_literal_import=True,
-        message=(
-            f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
-            f"but it only returns {suggested}"
-        ),
-        evidence=[
-            EvidenceItem(
-                kind="return_literals",
-                detail=f"Every return statement yields a constant in {suggested}",
-                file=func.file,
-                line=func.line,
-            )
-        ],
-        score=score_tier1_literal_return(
-            is_private=func.is_private, closed_world=config.closed_world
-        ),
-        is_public=not func.is_private,
-        is_single_constant=len(matching) == 1,
-    )
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT103,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=suggested,
+            needs_literal_import=True,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but it only returns {suggested}"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="return_literals",
+                    detail=f"Every return statement yields a constant in {suggested}",
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_literal_return(
+                is_private=func.is_private, closed_world=config.closed_world
+            ),
+            is_public=not func.is_private,
+            is_single_constant=len(matching) == 1,
+        )
+    ]
 
 
 def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandidate]:
@@ -422,7 +428,7 @@ def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandid
 def _rule_nt105_unused_union_return(
     func: FunctionInfo,
     config: NarrowerConfig,
-) -> NarrowingCandidate | None:
+) -> list[NarrowingCandidate]:
     """NT105: Return union `A | B | C` has unused non-None branch(es)."""
     members = func.return_union_members
     ret = func.body_facts.returns
@@ -435,7 +441,7 @@ def _rule_nt105_unused_union_return(
         or not ret.has_returns
         or ret.has_unknown_return_type
     ):
-        return None
+        return []
 
     observed = set(ret.returned_types)
     if ret.can_fallthrough:
@@ -443,36 +449,38 @@ def _rule_nt105_unused_union_return(
 
     used, unused = _partition_union_members(members, observed)
     if not used or not unused or unused == ["None"] or used == ["None"]:
-        return None
+        return []
 
     suggested = format_union_type(used)
-    return NarrowingCandidate(
-        code=RuleCode.NT105,
-        tier=Tier.LOCAL,
-        file=func.file,
-        line=func.return_line,
-        col=func.return_col,
-        symbol=func.qualname,
-        target_kind=TargetKind.RETURN,
-        target_name=None,
-        current_type=func.return_annotation_str,
-        suggested_type=suggested,
-        needs_literal_import=False,
-        message=(
-            f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
-            f"but branch(es) {', '.join(unused)} are never returned; narrow to `{suggested}`"
-        ),
-        evidence=[
-            EvidenceItem(
-                kind="return_types",
-                detail=f"Observed return types: {', '.join(sorted(observed))}",
-                file=func.file,
-                line=func.line,
-            )
-        ],
-        score=score_tier1_unused_union_return(is_private=func.is_private),
-        is_public=not func.is_private,
-    )
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT105,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=suggested,
+            needs_literal_import=False,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but branch(es) {', '.join(unused)} are never returned; narrow to `{suggested}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="return_types",
+                    detail=f"Observed return types: {', '.join(sorted(observed))}",
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_unused_union_return(is_private=func.is_private),
+            is_public=not func.is_private,
+        )
+    ]
 
 
 def _rule_nt201_callsite_literal(
