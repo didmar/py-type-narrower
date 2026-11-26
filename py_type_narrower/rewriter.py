@@ -27,6 +27,8 @@ def rewrite_files(
     """
     by_file: dict[Path, list[NarrowingCandidate]] = defaultdict(list)
     for cand in candidates:
+        if not cand.is_fixable:
+            continue
         by_file[cand.file.resolve()].append(cand)
 
     updated: dict[Path, str] = {}
@@ -269,12 +271,13 @@ class _NarrowingTransformer(cst.CSTTransformer):
 
 
 def rewrite_module_source(source: str, candidates: list[NarrowingCandidate]) -> str:
-    """Apply NarrowingCandidates belonging to a single module and return updated source."""
-    if not candidates:
+    """Apply fixable NarrowingCandidates belonging to a single module and return updated source."""
+    fixable = [c for c in candidates if c.is_fixable]
+    if not fixable:
         return source
 
     module = cst.parse_module(source)
-    transformer = _NarrowingTransformer(candidates)
+    transformer = _NarrowingTransformer(fixable)
     modified = module.visit(transformer)
 
     if transformer.added_literal and not _has_literal_import(modified):

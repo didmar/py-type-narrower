@@ -143,10 +143,13 @@ def _verify_pass(
     project_root: Path,
     adapter: TypeCheckerAdapter | None,
 ) -> tuple[list[NarrowingCandidate], list[NarrowingCandidate]]:
-    """Run soundness verification on a pass's candidates when an adapter is configured."""
+    """Run soundness verification on fixable candidates when an adapter is configured."""
     if adapter is None:
         return (candidates, [])
-    return verify_candidates(candidates, sources, project_root, adapter)
+    fixable = [c for c in candidates if c.is_fixable]
+    advisory = [c for c in candidates if not c.is_fixable]
+    verified, rejected = verify_candidates(fixable, sources, project_root, adapter)
+    return ([*verified, *advisory], rejected)
 
 
 def _select_fix_candidates(
@@ -156,11 +159,13 @@ def _select_fix_candidates(
 ) -> list[NarrowingCandidate]:
     """Choose which candidates are eligible for automatic rewriting."""
     if apply_all:
-        return [c for c in candidates if c.verification != VerificationStatus.REJECTED]
+        return [
+            c for c in candidates if c.is_fixable and c.verification != VerificationStatus.REJECTED
+        ]
     return [
         c
         for c in candidates
-        if c.tier == Tier.LOCAL and c.verification != VerificationStatus.REJECTED
+        if c.is_fixable and c.tier == Tier.LOCAL and c.verification != VerificationStatus.REJECTED
     ]
 
 

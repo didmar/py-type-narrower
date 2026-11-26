@@ -124,6 +124,13 @@ def score_tier1_concrete_any_return(*, is_private: bool) -> int:
     return 90 if is_private else 84
 
 
+def score_tier1_structured_dict_return(*, is_private: bool, matched_existing: bool) -> int:
+    """Score NT109 structured dict return narrowing."""
+    if matched_existing:
+        return 92 if is_private else 88
+    return 86 if is_private else 80
+
+
 def score_tier2_callsite_literal(ctx: CallSiteScoreContext) -> tuple[int, list[str]]:
     """Compute a 0-100 confidence score and explanation notes for NT201 / NT203 literals."""
     score = 55

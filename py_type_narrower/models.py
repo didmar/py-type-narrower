@@ -28,11 +28,13 @@ class RuleCode(StrEnum):
     NT106 = "NT106"  # Tier 1: Variadic tuple[T, ...] return -> fixed-length tuple[T1, T2]
     NT107 = "NT107"  # Tier 1: Container/generator element T | None never contains/yields None
     NT108 = "NT108"  # Tier 1: Any / object return narrowed to concrete observed return type(s)
+    NT109 = "NT109"  # Tier 1: Structured dict return -> TypedDict or dict[Literal[...], V]
     NT201 = "NT201"  # Tier 2: Call-site str/int parameter -> Literal[...]
     NT202 = "NT202"  # Tier 2: Call-site T | None parameter -> T
     NT203 = "NT203"  # Tier 2: Dataclass / NamedTuple field narrowing across call sites
     NT204 = "NT204"  # Tier 2: Call-site union parameter A | B | C has unused branch(es)
     NT205 = "NT205"  # Tier 2: Constant bool parameter -> Literal[True] / Literal[False]
+    NT206 = "NT206"  # Tier 2: Call-site structured dict param -> TypedDict or dict[Literal[...], V]
 
     @property
     def tier(self) -> Tier:
@@ -108,6 +110,7 @@ class NarrowingCandidate:
     is_public: bool = False
     is_single_constant: bool = False
     drop_none_default: bool = False
+    is_fixable: bool = True
     verification: VerificationStatus = VerificationStatus.UNVERIFIED
     blocking_diagnostics: list[str] = field(default_factory=list)
 

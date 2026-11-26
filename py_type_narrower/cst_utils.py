@@ -191,6 +191,50 @@ _MIN_UNION_MEMBERS = 2
 
 
 @dataclass(frozen=True)
+class DictAnnotationSpec:
+    """Parsed `dict[str, V]` / `Mapping[str, V]` / bare `dict` annotation."""
+
+    outer: str
+    value_type: str | None  # None for bare `dict`, or `Any`/`object`/concrete type string
+    is_broad_value: bool  # True when bare `dict` or value is `Any`/`object`
+
+
+_BROAD_VALUE_NAMES: frozenset[str] = frozenset({"Any", "typing.Any", "object", "builtins.object"})
+_NOT_REQUIRED_NAMES: frozenset[str] = frozenset(
+    {"NotRequired", "typing.NotRequired", "typing_extensions.NotRequired"}
+)
+_REQUIRED_NAMES: frozenset[str] = frozenset(
+    {"Required", "typing.Required", "typing_extensions.Required"}
+)
+
+
+def extract_not_required_inner(annotation: cst.Annotation | None) -> str | None:
+    """If annotation is `NotRequired[T]`, return `T`; else None."""
+    return _extract_single_wrapper_inner(annotation, _NOT_REQUIRED_NAMES)
+
+
+def extract_required_inner(annotation: cst.Annotation | None) -> str | None:
+    """If annotation is `Required[T]`, return `T`; else None."""
+    return _extract_single_wrapper_inner(annotation, _REQUIRED_NAMES)
+
+
+def _extract_single_wrapper_inner(
+    annotation: cst.Annotation | None,
+    wrapper_names: frozenset[str],
+) -> str | None:
+    """Extract `T` from a 1-arg wrapper like `NotRequired[T]` or `Required[T]`."""
+    if annotation is None or not isinstance(annotation.annotation, cst.Subscript):
+        return None
+    expr = annotation.annotation
+    if _annotation_simple_name(expr.value) not in wrapper_names:
+        return None
+    args = _extract_subscript_index_args(expr)
+    if args is None or len(args) != 1:
+        return None
+    return expr_to_code(args[0])
+
+
+@dataclass(frozen=True)
 class ContainerOptionalSpec:
     """Parsed container or generator return annotation whose element/value/yield is Optional."""
 
@@ -240,6 +284,33 @@ _DICT_CONTAINER_NAMES: frozenset[str] = frozenset(
         "collections.abc.MutableMapping",
     }
 )
+
+
+def extract_str_key_dict_annotation(annotation_str: str | None) -> DictAnnotationSpec | None:
+    """Return DictAnnotationSpec if annotation is `dict[str, V]`, `Mapping[str, V]`, or `dict`."""
+    if annotation_str is None:
+        return None
+    stripped = annotation_str.strip()
+    if stripped in _DICT_CONTAINER_NAMES:
+        return DictAnnotationSpec(outer=stripped, value_type=None, is_broad_value=True)
+    expr = _parse_subscript_annotation(stripped)
+    args = _extract_subscript_index_args(expr) if expr is not None else None
+    if (
+        expr is None
+        or args is None
+        or len(args) != _MIN_UNION_MEMBERS
+        or _annotation_simple_name(expr.value) not in _DICT_CONTAINER_NAMES
+        or _annotation_simple_name(args[0]) not in {"str", "builtins.str"}
+    ):
+        return None
+    val_str = expr_to_code(args[1])
+    return DictAnnotationSpec(
+        outer=expr_to_code(expr.value),
+        value_type=val_str,
+        is_broad_value=val_str in _BROAD_VALUE_NAMES,
+    )
+
+
 _GENERATOR_ONLY_NAMES: frozenset[str] = frozenset(
     {
         "Iterator",

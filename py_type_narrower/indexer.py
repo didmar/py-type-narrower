@@ -22,7 +22,9 @@ from py_type_narrower.cst_utils import (
     expr_to_code,
     extract_literal,
     extract_literal_values_from_annotation,
+    extract_not_required_inner,
     extract_optional_inner,
+    extract_required_inner,
     extract_union_members,
     infer_simple_expr_type,
     is_bool_annotation,
@@ -37,20 +39,14 @@ ABSTRACT_BASE_NAMES: frozenset[str] = frozenset(
     {"ABC", "Protocol", "abc.ABC", "typing.Protocol", "typing_extensions.Protocol"}
 )
 NAMEDTUPLE_BASE_NAMES: frozenset[str] = frozenset({"NamedTuple", "typing.NamedTuple"})
+TYPEDDICT_BASE_NAMES: frozenset[str] = frozenset(
+    {"TypedDict", "typing.TypedDict", "typing_extensions.TypedDict"}
+)
 TRIVIAL_BASE_NAMES: frozenset[str] = (
     ABSTRACT_BASE_NAMES
     | NAMEDTUPLE_BASE_NAMES
-    | frozenset(
-        {
-            "object",
-            "builtins.object",
-            "Generic",
-            "typing.Generic",
-            "TypedDict",
-            "typing.TypedDict",
-            "typing_extensions.TypedDict",
-        }
-    )
+    | TYPEDDICT_BASE_NAMES
+    | frozenset({"object", "builtins.object", "Generic", "typing.Generic"})
 )
 
 
@@ -88,6 +84,8 @@ class FieldInfo:
     default_is_none: bool
     default_literal: ExtractedLiteral | None
     is_kw_only: bool = False
+    is_not_required: bool = False
+    not_required_inner: str | None = None
 
 
 @dataclass
@@ -136,6 +134,7 @@ class ObservedArg:
     literals: tuple[ExtractedLiteral, ...] | None = None
     is_unknown: bool = False
     observed_type: str | None = None
+    dict_literal_keys: tuple[tuple[str, str | None], ...] | None = None
 
 
 @dataclass
@@ -164,6 +163,8 @@ class ClassInfo:
     is_protocol_or_abc: bool = False
     is_dataclass: bool = False
     is_namedtuple: bool = False
+    is_typeddict: bool = False
+    typeddict_total: bool = True
     is_kw_only_dataclass: bool = False
     fields: list[FieldInfo] = field(default_factory=list)
     attr_facts: list[ClassAttrFact] = field(default_factory=list)
@@ -179,6 +180,7 @@ class CodebaseIndex:
     classes: dict[str, ClassInfo] = field(default_factory=dict)
     call_stats: dict[tuple[str, str], ParamCallStats] = field(default_factory=dict)
     field_stats: dict[tuple[str, str], ParamCallStats] = field(default_factory=dict)
+    module_imports: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -228,6 +230,8 @@ def index_files(
     # Resolve class inheritance overrides and module re-exports across modules.
     classes_by_short_name = _mark_method_overrides(index)
     _resolve_module_reexports(module_contexts, index)
+    for ctx in module_contexts:
+        index.module_imports[ctx.module_name] = dict(ctx.imports)
 
     # Pass 2: walk calls across all modules and bind arguments to target FunctionInfo params.
     for ctx in module_contexts:
@@ -429,6 +433,8 @@ class _DefinitionCollector(cst.CSTVisitor):
         is_proto_abc = any(base in ABSTRACT_BASE_NAMES for base in bases)
         is_dataclass, is_kw_only_dc = _inspect_dataclass_decorator(node)
         is_namedtuple = any(base in NAMEDTUPLE_BASE_NAMES for base in bases)
+        is_typeddict = any(base in TYPEDDICT_BASE_NAMES for base in bases)
+        typeddict_total = _extract_typeddict_total(node) if is_typeddict else True
         prefix = ".".join(c.name for c in self._class_stack)
         cls_name = f"{prefix}.{node.name.value}" if prefix else node.name.value
         qualname = f"{self.module_name}.{cls_name}"
@@ -439,13 +445,18 @@ class _DefinitionCollector(cst.CSTVisitor):
             in_nested_function=self._func_depth > 0,
         )
         fields = (
-            self._extract_structured_fields(node, is_kw_only_dc=is_kw_only_dc)
-            if (is_dataclass or is_namedtuple)
+            self._extract_structured_fields(
+                node,
+                is_kw_only_dc=is_kw_only_dc,
+                is_typeddict=is_typeddict,
+                typeddict_total=typeddict_total,
+            )
+            if (is_dataclass or is_namedtuple or is_typeddict)
             else []
         )
         attr_facts = (
             analyze_class_attributes(node, self.known_class_names, self._node_position)
-            if not (is_proto_abc or is_dataclass or is_namedtuple)
+            if not (is_proto_abc or is_dataclass or is_namedtuple or is_typeddict)
             else []
         )
         cls_info = ClassInfo(
@@ -461,6 +472,8 @@ class _DefinitionCollector(cst.CSTVisitor):
             is_protocol_or_abc=is_proto_abc,
             is_dataclass=is_dataclass,
             is_namedtuple=is_namedtuple,
+            is_typeddict=is_typeddict,
+            typeddict_total=typeddict_total,
             is_kw_only_dataclass=is_kw_only_dc,
             fields=fields,
             attr_facts=attr_facts,
@@ -479,12 +492,14 @@ class _DefinitionCollector(cst.CSTVisitor):
         cls_node: cst.ClassDef,
         *,
         is_kw_only_dc: bool,
+        is_typeddict: bool = False,
+        typeddict_total: bool = True,
     ) -> list[FieldInfo]:
-        """Extract dataclass / NamedTuple fields from class body annotations."""
+        """Extract dataclass / NamedTuple / TypedDict fields from class body annotations."""
         if not isinstance(cls_node.body, cst.IndentedBlock):
             return []
         fields: list[FieldInfo] = []
-        kw_only_active = is_kw_only_dc
+        kw_only_active = is_kw_only_dc or is_typeddict
         for stmt in cls_node.body.body:
             if not isinstance(stmt, cst.SimpleStatementLine):
                 continue
@@ -497,7 +512,13 @@ class _DefinitionCollector(cst.CSTVisitor):
                     continue
                 if ann_str.startswith(("ClassVar", "typing.ClassVar")):
                     continue
-                field_info = self._build_field_info(small, ann_str, kw_only_active=kw_only_active)
+                field_info = self._build_field_info(
+                    small,
+                    ann_str,
+                    kw_only_active=kw_only_active,
+                    is_typeddict=is_typeddict,
+                    typeddict_total=typeddict_total,
+                )
                 if field_info is not None:
                     fields.append(field_info)
         return fields
@@ -508,6 +529,8 @@ class _DefinitionCollector(cst.CSTVisitor):
         ann_str: str,
         *,
         kw_only_active: bool,
+        is_typeddict: bool = False,
+        typeddict_total: bool = True,
     ) -> FieldInfo | None:
         """Build a FieldInfo from a single class-body AnnAssign, skipping init=False fields."""
         if not isinstance(stmt.target, cst.Name):
@@ -528,6 +551,11 @@ class _DefinitionCollector(cst.CSTVisitor):
             default_is_none = is_none_expr(val)
             default_lit = extract_literal(val)
 
+        not_req_inner = extract_not_required_inner(stmt.annotation) if is_typeddict else None
+        req_inner = extract_required_inner(stmt.annotation) if is_typeddict else None
+        is_not_required = not_req_inner is not None or (
+            is_typeddict and not typeddict_total and req_inner is None
+        )
         pos = self.get_metadata(PositionProvider, stmt.target)
         return FieldInfo(
             name=stmt.target.value,
@@ -536,10 +564,12 @@ class _DefinitionCollector(cst.CSTVisitor):
             annotation_str=ann_str,
             primitive_kind=base_primitive_annotation(stmt.annotation),
             optional_inner=extract_optional_inner(stmt.annotation),
-            has_default=has_default,
+            has_default=has_default or is_not_required,
             default_is_none=default_is_none,
             default_literal=default_lit,
             is_kw_only=field_kw_only,
+            is_not_required=is_not_required,
+            not_required_inner=not_req_inner,
         )
 
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: N802
@@ -874,6 +904,16 @@ class _LocalVarBinding:
     is_non_none: bool = False
     class_type: str | None = None
     inferred_type: str | None = None
+
+
+def _extract_typeddict_total(node: cst.ClassDef) -> bool:
+    """Return False if a TypedDict class declares `total=False`, else True."""
+    for kw in node.keywords:
+        if kw.keyword is not None and kw.keyword.value == "total":
+            lit = extract_literal(kw.value)
+            if lit is not None and lit.kind == "bool" and isinstance(lit.value, bool):
+                return lit.value
+    return True
 
 
 def _inspect_dataclass_decorator(node: cst.ClassDef) -> tuple[bool, bool]:
@@ -1366,6 +1406,8 @@ class _CallSiteCollector(cst.CSTVisitor):
         if isinstance(expr, cst.Name):
             return self._classify_name_arg(expr.value, line)
 
+        dict_keys = self._extract_const_str_dict_arg(expr) if isinstance(expr, cst.Dict) else None
+
         inferred = infer_simple_expr_type(expr)
         if (
             inferred is None
@@ -1383,6 +1425,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                 is_non_none=True,
                 is_unknown=True,
                 observed_type=inferred,
+                dict_literal_keys=dict_keys,
             )
 
         return ObservedArg(
@@ -1430,6 +1473,39 @@ class _CallSiteCollector(cst.CSTVisitor):
             is_test_caller=self.ctx.is_test_file,
             is_unknown=True,
         )
+
+    def _extract_const_str_dict_arg(
+        self,
+        expr: cst.Dict,
+    ) -> tuple[tuple[str, str | None], ...] | None:
+        """Extract `(key, inferred_val_type)` pairs if expr is a constant-string-key dict literal."""
+        entries: list[tuple[str, str | None]] = []
+        for elem in expr.elements:
+            if not isinstance(elem, cst.DictElement):
+                return None
+            key_lit = extract_literal(elem.key)
+            if key_lit is None or key_lit.kind != "str" or not isinstance(key_lit.value, str):
+                return None
+            val_type = self._infer_call_expr_type(elem.value)
+            entries.append((key_lit.value, val_type))
+        return tuple(entries)
+
+    def _infer_call_expr_type(self, expr: cst.BaseExpression) -> str | None:
+        """Infer a conservative static type string for an argument or dict-value expression."""
+        simple = infer_simple_expr_type(expr)
+        if simple is not None:
+            return simple
+        if isinstance(expr, cst.Name):
+            binding = self._lookup_local_var(expr.value)
+            if binding is not None and binding.inferred_type is not None:
+                return binding.inferred_type
+        if (
+            self._is_known_class_ctor_call(expr)
+            and isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+        ):
+            return expr.func.value
+        return None
 
     def _is_known_class_ctor_call(self, expr: cst.BaseExpression) -> bool:
         """Return True if expr is a direct call to an indexed class constructor."""

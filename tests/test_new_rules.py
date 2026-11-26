@@ -436,3 +436,102 @@ def returns_only_none() -> Any:
     rewritten = rewrite_module_source(code, list(nt108.values()))
     assert "def make_widget(flag: bool) -> Widget | None:" in rewritten
     assert "def compute_label(name: str) -> str:" in rewritten
+
+
+def test_nt109_structured_dict_returns_typeddict_and_literal_keys(tmp_path: Path) -> None:
+    code = """from typing import Any, NotRequired, TypedDict
+
+class UserRecord(TypedDict):
+    id: int
+    name: str
+    email: NotRequired[str]
+
+def build_user(flag: bool) -> dict[str, Any]:
+    if flag:
+        return {"id": 1, "name": "Ada", "email": "ada@example.com"}
+    return {"id": 2, "name": "Grace"}
+
+def build_counts() -> dict[str, int]:
+    return {"ok": 1, "err": 0}
+
+def build_ad_hoc(flag: bool) -> dict[str, Any]:
+    if flag:
+        return {"host": "localhost", "port": 8080, "tls": True}
+    return {"host": "localhost", "port": 80}
+
+def dynamic_dict(k: str) -> dict[str, int]:
+    return {k: 1}
+"""
+    mod = tmp_path / "records.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt109 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT109}
+
+    assert set(nt109.keys()) == {"build_user", "build_counts", "build_ad_hoc"}
+
+    # Matches existing in-scope TypedDict -> auto-fixable!
+    assert nt109["build_user"].suggested_type == "UserRecord"
+    assert nt109["build_user"].is_fixable is True
+
+    # Homogeneous concrete dict[str, int] -> dict[Literal[...], int], auto-fixable!
+    assert nt109["build_counts"].suggested_type == 'dict[Literal["err", "ok"], int]'
+    assert nt109["build_counts"].is_fixable is True
+    assert nt109["build_counts"].needs_literal_import is True
+
+    # Broad dict[str, Any] with no matching TypedDict -> advisory schema (not auto-rewritten)
+    assert (
+        nt109["build_ad_hoc"].suggested_type
+        == "TypedDict({'host': str, 'port': int, 'tls': NotRequired[bool]})"
+    )
+    assert nt109["build_ad_hoc"].is_fixable is False
+
+    rewritten = rewrite_module_source(code, list(nt109.values()))
+    assert "def build_user(flag: bool) -> UserRecord:" in rewritten
+    assert 'def build_counts() -> dict[Literal["err", "ok"], int]:' in rewritten
+    # Advisory candidate is preserved verbatim by the rewriter
+    assert "def build_ad_hoc(flag: bool) -> dict[str, Any]:" in rewritten
+
+
+def test_nt206_callsite_structured_dict_param(tmp_path: Path) -> None:
+    code = """from typing import Any, TypedDict
+
+class MetricEvent(TypedDict):
+    name: str
+    value: int
+
+def _record_metric(payload: dict[str, Any]) -> None:
+    _ = payload
+
+def _track_scores(scores: dict[str, int]) -> None:
+    _ = scores
+
+def _log_extra(meta: dict[str, Any]) -> None:
+    _ = meta
+
+def caller() -> None:
+    _record_metric({"name": "cpu", "value": 90})
+    _record_metric({"name": "mem", "value": 45})
+    _track_scores({"a": 1, "b": 2})
+    _track_scores({"a": 3, "b": 4})
+    _log_extra({"env": "prod", "retries": 2})
+    _log_extra({"env": "dev", "retries": 0})
+"""
+    mod = tmp_path / "metrics.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    nt206 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT206}
+
+    assert set(nt206.keys()) == {"_record_metric", "_track_scores", "_log_extra"}
+    assert nt206["_record_metric"].suggested_type == "MetricEvent"
+    assert nt206["_record_metric"].is_fixable is True
+    assert nt206["_track_scores"].suggested_type == 'dict[Literal["a", "b"], int]'
+    assert nt206["_track_scores"].is_fixable is True
+    assert nt206["_log_extra"].suggested_type == "TypedDict({'env': str, 'retries': int})"
+    assert nt206["_log_extra"].is_fixable is False
+
+    rewritten = rewrite_module_source(code, list(nt206.values()))
+    assert "def _record_metric(payload: MetricEvent) -> None:" in rewritten
+    assert 'def _track_scores(scores: dict[Literal["a", "b"], int]) -> None:' in rewritten
+    assert "def _log_extra(meta: dict[str, Any]) -> None:" in rewritten

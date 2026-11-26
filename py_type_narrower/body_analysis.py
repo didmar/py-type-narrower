@@ -42,6 +42,11 @@ class ReturnSummary:
     has_non_empty_seq_element: bool = False
     all_returns_non_none_dict: bool = True
     has_non_empty_dict_entry: bool = False
+    all_returns_const_str_dict: bool = True
+    dict_return_count: int = 0
+    dict_key_presence: dict[str, int] = field(default_factory=dict)
+    dict_key_types: dict[str, set[str]] = field(default_factory=dict)
+    dict_key_unknown: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -395,6 +400,11 @@ class _ReturnCollector(cst.CSTVisitor):
         self.has_non_empty_seq_element = False
         self.all_returns_non_none_dict = True
         self.has_non_empty_dict_entry = False
+        self.all_returns_const_str_dict = True
+        self.dict_return_count = 0
+        self.dict_key_presence: dict[str, int] = {}
+        self.dict_key_types: dict[str, set[str]] = {}
+        self.dict_key_unknown: set[str] = set()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
         return False
@@ -421,6 +431,7 @@ class _ReturnCollector(cst.CSTVisitor):
             self.all_returns_fixed_tuple = False
             self.all_returns_non_none_seq = False
             self.all_returns_non_none_dict = False
+            self.all_returns_const_str_dict = False
             self.returned_types.add("None")
             return False
 
@@ -436,6 +447,7 @@ class _ReturnCollector(cst.CSTVisitor):
         self._record_fixed_tuple(node.value)
         self._record_non_none_seq(node.value)
         self._record_non_none_dict(node.value)
+        self._record_const_str_dict(node.value)
 
         lit = extract_literal(node.value)
         if lit is not None:
@@ -495,6 +507,39 @@ class _ReturnCollector(cst.CSTVisitor):
                 self.has_non_empty_dict_entry = True
                 return
         self.all_returns_non_none_dict = False
+
+    def _record_const_str_dict(self, expr: cst.BaseExpression) -> None:
+        """Track constant-string-key dict literal returns and per-key inferred value types."""
+        if not self.all_returns_const_str_dict:
+            return
+        if isinstance(expr, cst.IfExp):
+            self._record_const_str_dict(expr.body)
+            self._record_const_str_dict(expr.orelse)
+            return
+        if not isinstance(expr, cst.Dict):
+            self.all_returns_const_str_dict = False
+            return
+        seen_in_return: set[str] = set()
+        for elem in expr.elements:
+            if not isinstance(elem, cst.DictElement):
+                self.all_returns_const_str_dict = False
+                return
+            key_lit = extract_literal(elem.key)
+            if key_lit is None or key_lit.kind != "str" or not isinstance(key_lit.value, str):
+                self.all_returns_const_str_dict = False
+                return
+            key = key_lit.value
+            seen_in_return.add(key)
+            val_types = _infer_expr_types_in_scope(
+                elem.value, self.local_types, self.known_class_names
+            )
+            if val_types is None:
+                self.dict_key_unknown.add(key)
+            else:
+                self.dict_key_types.setdefault(key, set()).update(val_types)
+        self.dict_return_count += 1
+        for key in seen_in_return:
+            self.dict_key_presence[key] = self.dict_key_presence.get(key, 0) + 1
 
     def _record_fixed_tuple(self, expr: cst.BaseExpression) -> None:
         """Track fixed-length tuple literal returns and per-slot inferred types."""
@@ -569,6 +614,11 @@ def _analyze_returns(
     summary.has_non_empty_seq_element = collector.has_non_empty_seq_element
     summary.all_returns_non_none_dict = collector.all_returns_non_none_dict
     summary.has_non_empty_dict_entry = collector.has_non_empty_dict_entry
+    summary.all_returns_const_str_dict = collector.all_returns_const_str_dict
+    summary.dict_return_count = collector.dict_return_count
+    summary.dict_key_presence = collector.dict_key_presence
+    summary.dict_key_types = collector.dict_key_types
+    summary.dict_key_unknown = collector.dict_key_unknown
     summary.can_fallthrough = not _block_always_terminates(stmts)
     return summary
 

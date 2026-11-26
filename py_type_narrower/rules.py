@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import libcst as cst
 
 from py_type_narrower.body_analysis import filter_literals_by_kind
 from py_type_narrower.cst_utils import (
+    DictAnnotationSpec,
     ExtractedLiteral,
     extract_optional_container_return,
+    extract_required_inner,
+    extract_str_key_dict_annotation,
     extract_union_members,
     extract_variadic_tuple_element,
     format_literal_type,
@@ -35,6 +39,7 @@ from py_type_narrower.scorer import (
     score_tier1_fixed_tuple_return,
     score_tier1_guarded_param,
     score_tier1_literal_return,
+    score_tier1_structured_dict_return,
     score_tier1_unused_optional_return,
     score_tier1_unused_union_return,
     score_tier2_callsite_literal,
@@ -102,6 +107,15 @@ DATA_MODEL_DUNDER_METHODS: frozenset[str] = frozenset(
 MODULE_DUNDER_FUNCTIONS: frozenset[str] = frozenset({"__getattr__", "__dir__"})
 
 
+@dataclass(frozen=True)
+class _RuleEvalContext:
+    """Shared read-only evaluation context threaded across rule evaluators."""
+
+    index: CodebaseIndex
+    config: NarrowerConfig
+    active: set[RuleCode]
+
+
 def run_rules(
     index: CodebaseIndex,
     config: NarrowerConfig,
@@ -113,7 +127,7 @@ def run_rules(
     When `target_files` is provided, only definitions inside those files are reported,
     while the full index still supplies cross-file call sites and class hierarchies.
     """
-    active = config.active_rules()
+    ctx = _RuleEvalContext(index=index, config=config, active=config.active_rules())
     resolved_targets = {p.resolve() for p in target_files} if target_files is not None else None
     candidates: list[NarrowingCandidate] = []
 
@@ -122,53 +136,48 @@ def run_rules(
             continue
         if func.is_test_file and not config.include_test_files:
             continue
-        _evaluate_function_rules(func, index, config, active, candidates)
+        _evaluate_function_rules(func, ctx, candidates)
 
     for cls in sorted(index.classes.values(), key=lambda c: (str(c.file), c.line, c.col)):
         if resolved_targets is not None and cls.file.resolve() not in resolved_targets:
             continue
         if cls.is_test_file and not config.include_test_files:
             continue
-        _evaluate_class_rules(cls, index, config, active, candidates)
+        _evaluate_class_rules(cls, ctx, candidates)
 
     return _filter_ignored_and_scored(candidates, index, config)
 
 
 def _evaluate_function_rules(
     func: FunctionInfo,
-    index: CodebaseIndex,
-    config: NarrowerConfig,
-    active: set[RuleCode],
+    ctx: _RuleEvalContext,
     out: list[NarrowingCandidate],
 ) -> None:
     """Run Tier 1 and Tier 2 rules on a single FunctionInfo."""
-    if config.max_tier >= Tier.LOCAL:
-        _run_tier1_function_rules(func, config, active, out)
-    if config.max_tier >= Tier.WHOLE_REPO:
-        _run_tier2_function_rules(func, index, config, active, out)
+    if ctx.config.max_tier >= Tier.LOCAL:
+        _run_tier1_function_rules(func, ctx, out)
+    if ctx.config.max_tier >= Tier.WHOLE_REPO:
+        _run_tier2_function_rules(func, ctx, out)
 
 
 def _evaluate_class_rules(
     cls: ClassInfo,
-    index: CodebaseIndex,
-    config: NarrowerConfig,
-    active: set[RuleCode],
+    ctx: _RuleEvalContext,
     out: list[NarrowingCandidate],
 ) -> None:
     """Run Tier 1 (NT104) and Tier 2 (NT203) rules on a single ClassInfo."""
-    if config.max_tier >= Tier.LOCAL and RuleCode.NT104 in active:
+    if ctx.config.max_tier >= Tier.LOCAL and RuleCode.NT104 in ctx.active:
         out.extend(_rule_nt104_always_initialized_attrs(cls))
-    if config.max_tier >= Tier.WHOLE_REPO and RuleCode.NT203 in active:
-        out.extend(_rule_nt203_structured_fields(cls, index, config))
+    if ctx.config.max_tier >= Tier.WHOLE_REPO and RuleCode.NT203 in ctx.active:
+        out.extend(_rule_nt203_structured_fields(cls, ctx.index, ctx.config))
 
 
 def _run_tier1_function_rules(
     func: FunctionInfo,
-    config: NarrowerConfig,
-    active: set[RuleCode],
+    ctx: _RuleEvalContext,
     out: list[NarrowingCandidate],
 ) -> None:
-    """Evaluate local high-confidence function rules in priority order (NT101, NT105, NT102, NT103)."""
+    """Evaluate local high-confidence function rules in priority order."""
     rules: tuple[tuple[RuleCode, Tier1FunctionRule], ...] = (
         (RuleCode.NT101, _rule_nt101_guarded_params),
         (RuleCode.NT105, _rule_nt105_unused_union_return),
@@ -180,23 +189,23 @@ def _run_tier1_function_rules(
     )
     seen_targets: set[tuple[TargetKind, str | None]] = set()
     for code, rule_fn in rules:
-        if code not in active:
+        if code not in ctx.active:
             continue
-        for cand in rule_fn(func, config):
+        for cand in rule_fn(func, ctx.config):
             target = (cand.target_kind, cand.target_name)
             if target not in seen_targets:
                 seen_targets.add(target)
                 out.append(cand)
+    if RuleCode.NT109 in ctx.active and (TargetKind.RETURN, None) not in seen_targets:
+        out.extend(_rule_nt109_structured_dict_return(func, ctx.index, ctx.config))
 
 
 def _run_tier2_function_rules(
     func: FunctionInfo,
-    index: CodebaseIndex,
-    config: NarrowerConfig,
-    active: set[RuleCode],
+    ctx: _RuleEvalContext,
     out: list[NarrowingCandidate],
 ) -> None:
-    """Evaluate whole-repo call-site function rules (NT201, NT204, NT202, NT205)."""
+    """Evaluate whole-repo call-site function rules (NT201, NT204, NT202, NT205, NT206)."""
     if _skip_param_narrowing_for_hierarchy(func):
         return
     if func.in_external_subclass and not func.is_private and func.name != "__init__":
@@ -207,10 +216,10 @@ def _run_tier2_function_rules(
     for param in _non_receiver_params(func):
         if param.name in nt101_params:
             continue
-        stats = index.call_stats.get((func.qualname, param.name))
+        stats = ctx.index.call_stats.get((func.qualname, param.name))
         if stats is None or not stats.observations or stats.has_dynamic_star_call:
             continue
-        cand = _evaluate_param_tier2(func, param, stats, config, active)
+        cand = _evaluate_param_tier2(func, param, stats, ctx)
         if cand is not None:
             out.append(cand)
 
@@ -219,10 +228,9 @@ def _evaluate_param_tier2(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    config: NarrowerConfig,
-    active: set[RuleCode],
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
-    """Evaluate Tier 2 parameter rules in priority order (NT201, NT204, NT202, NT205)."""
+    """Evaluate Tier 2 parameter rules in priority order (NT201, NT204, NT202, NT205, NT206)."""
     rules: tuple[tuple[RuleCode, Tier2ParamRule], ...] = (
         (RuleCode.NT201, _rule_nt201_callsite_literal),
         (RuleCode.NT204, _rule_nt204_unused_union_param),
@@ -230,11 +238,13 @@ def _evaluate_param_tier2(
         (RuleCode.NT205, _rule_nt205_constant_bool_param),
     )
     for code, rule_fn in rules:
-        if code not in active:
+        if code not in ctx.active:
             continue
-        cand = rule_fn(func, param, stats, config)
+        cand = rule_fn(func, param, stats, ctx.config)
         if cand is not None:
             return cand
+    if RuleCode.NT206 in ctx.active:
+        return _rule_nt206_callsite_structured_dict(func, param, stats, ctx.index, ctx.config)
     return None
 
 
@@ -595,15 +605,6 @@ def _resolve_fixed_tuple_slot_types(
     return resolved
 
 
-def _parse_union_members(type_str: str) -> tuple[str, ...] | None:
-    """Parse a type string as a top-level union if possible."""
-    try:
-        expr = cst.parse_expression(type_str)
-    except cst.ParserSyntaxError:
-        return None
-    return extract_union_members(cst.Annotation(annotation=expr))
-
-
 def _rule_nt107_container_non_none_return(
     func: FunctionInfo,
     config: NarrowerConfig,
@@ -737,6 +738,356 @@ def _rule_nt108_concrete_any_return(
             is_public=not func.is_private,
         )
     ]
+
+
+@dataclass(frozen=True)
+class _DictShape:
+    """Observed constant-string-key shape aggregated across dict literals."""
+
+    sample_count: int
+    key_presence: dict[str, int]
+    key_types: dict[str, set[str]]
+    key_unknown: set[str]
+
+
+@dataclass(frozen=True)
+class _DictNarrowingResolution:
+    """Resolved target type and metadata for a structured dict narrowing."""
+
+    suggested_type: str
+    is_fixable: bool
+    needs_literal_import: bool
+    matched_existing_td: bool
+    detail: str
+
+
+_MAX_TYPEDDICT_KEYS = 12
+
+
+def _rule_nt109_structured_dict_return(
+    func: FunctionInfo,
+    index: CodebaseIndex,
+    config: NarrowerConfig,
+) -> list[NarrowingCandidate]:
+    """NT109: Structured dict return narrows to an existing TypedDict, dict[Literal, V], or TypedDict schema."""
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+        return []
+    dict_spec = extract_str_key_dict_annotation(func.return_annotation_str)
+    if dict_spec is None:
+        return []
+    ret = func.body_facts.returns
+    if (
+        ret.is_stub
+        or ret.is_generator
+        or not ret.has_returns
+        or ret.can_fallthrough
+        or not ret.all_returns_const_str_dict
+        or ret.dict_return_count == 0
+        or not ret.dict_key_presence
+    ):
+        return []
+
+    shape = _DictShape(
+        sample_count=ret.dict_return_count,
+        key_presence=ret.dict_key_presence,
+        key_types=ret.dict_key_types,
+        key_unknown=ret.dict_key_unknown,
+    )
+    resolution = _resolve_structured_dict_narrowing(
+        dict_spec=dict_spec,
+        shape=shape,
+        module_name=func.module_name,
+        index=index,
+        max_literals=config.max_literals,
+    )
+    if resolution is None:
+        return []
+
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT109,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=resolution.suggested_type,
+            needs_literal_import=resolution.needs_literal_import,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but all returns have fixed keys; narrow to `{resolution.suggested_type}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="structured_dict_return",
+                    detail=resolution.detail,
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_structured_dict_return(
+                is_private=func.is_private,
+                matched_existing=resolution.matched_existing_td,
+            ),
+            is_public=not func.is_private,
+            is_fixable=resolution.is_fixable,
+        )
+    ]
+
+
+def _rule_nt206_callsite_structured_dict(
+    func: FunctionInfo,
+    param: ParamInfo,
+    stats: ParamCallStats,
+    index: CodebaseIndex,
+    config: NarrowerConfig,
+) -> NarrowingCandidate | None:
+    """NT206: Call-site structured dict parameter narrows to TypedDict or dict[Literal, V]."""
+    dict_spec = extract_str_key_dict_annotation(param.annotation_str)
+    if dict_spec is None or param.annotation_str is None or param.has_default:
+        return None
+    if any(obs.dict_literal_keys is None for obs in stats.observations):
+        return None
+
+    shape = _aggregate_callsite_dict_shape(stats)
+    if shape is None:
+        return None
+
+    resolution = _resolve_structured_dict_narrowing(
+        dict_spec=dict_spec,
+        shape=shape,
+        module_name=func.module_name,
+        index=index,
+        max_literals=config.max_literals,
+    )
+    if resolution is None:
+        return None
+
+    score, notes = score_tier2_unused_optional_param(
+        OptionalParamScoreContext(
+            is_private=func.is_private,
+            closed_world=config.closed_world,
+            call_count=len(stats.observations),
+            min_call_sites=config.min_call_sites,
+            only_test_callers=all(o.is_test_caller for o in stats.observations),
+            has_none_default=False,
+        )
+    )
+    evidence = [
+        EvidenceItem(
+            kind="callsite_structured_dict",
+            detail=f"{len(stats.observations)} call(s); {resolution.detail}",
+            file=func.file,
+            line=param.line,
+        ),
+        *[EvidenceItem(kind="score_factor", detail=note) for note in notes],
+    ]
+    return NarrowingCandidate(
+        code=RuleCode.NT206,
+        tier=Tier.WHOLE_REPO,
+        file=func.file,
+        line=param.line,
+        col=param.col,
+        symbol=func.qualname,
+        target_kind=TargetKind.PARAMETER,
+        target_name=param.name,
+        current_type=param.annotation_str,
+        suggested_type=resolution.suggested_type,
+        needs_literal_import=resolution.needs_literal_import,
+        message=(
+            f"Parameter `{param.name}` in `{func.name}` is `{param.annotation_str}`, "
+            f"but all {len(stats.observations)} call(s) pass structured dict literals; "
+            f"narrow to `{resolution.suggested_type}`"
+        ),
+        evidence=evidence,
+        score=score,
+        is_public=not func.is_private,
+        is_fixable=resolution.is_fixable,
+    )
+
+
+def _aggregate_callsite_dict_shape(stats: ParamCallStats) -> _DictShape | None:
+    """Aggregate constant-string-key dict observations across call sites."""
+    key_presence: dict[str, int] = {}
+    key_types: dict[str, set[str]] = {}
+    key_unknown: set[str] = set()
+    for obs in stats.observations:
+        entries = obs.dict_literal_keys
+        if entries is None:
+            return None
+        seen: set[str] = set()
+        for key, val_type in entries:
+            seen.add(key)
+            if val_type is None:
+                key_unknown.add(key)
+            else:
+                key_types.setdefault(key, set()).add(val_type)
+        for key in seen:
+            key_presence[key] = key_presence.get(key, 0) + 1
+    if not key_presence:
+        return None
+    return _DictShape(
+        sample_count=len(stats.observations),
+        key_presence=key_presence,
+        key_types=key_types,
+        key_unknown=key_unknown,
+    )
+
+
+def _resolve_structured_dict_narrowing(
+    *,
+    dict_spec: DictAnnotationSpec,
+    shape: _DictShape,
+    module_name: str,
+    index: CodebaseIndex,
+    max_literals: int,
+) -> _DictNarrowingResolution | None:
+    """Choose best narrowing: existing in-scope TypedDict, dict[Literal, V], or TypedDict schema."""
+    key_count = len(shape.key_presence)
+    if key_count == 0 or key_count > max(max_literals, _MAX_TYPEDDICT_KEYS):
+        return None
+
+    matched_td = _find_matching_typeddict(shape, module_name, index)
+    if matched_td is not None:
+        keys_str = ", ".join(repr(k) for k in sorted(shape.key_presence))
+        return _DictNarrowingResolution(
+            suggested_type=matched_td,
+            is_fixable=True,
+            needs_literal_import=False,
+            matched_existing_td=True,
+            detail=f"Matches existing TypedDict `{matched_td}` for keys {{{keys_str}}}",
+        )
+
+    if (
+        not dict_spec.is_broad_value
+        and dict_spec.value_type is not None
+        and key_count <= max_literals
+    ):
+        key_lits = [ExtractedLiteral(kind="str", value=k) for k in sorted(shape.key_presence)]
+        lit_str = format_literal_type(key_lits)
+        suggested = f"{dict_spec.outer}[{lit_str}, {dict_spec.value_type}]"
+        return _DictNarrowingResolution(
+            suggested_type=suggested,
+            is_fixable=True,
+            needs_literal_import=True,
+            matched_existing_td=False,
+            detail=f"All dict keys belong to {lit_str}",
+        )
+
+    if dict_spec.is_broad_value:
+        schema = _format_typeddict_suggestion(shape)
+        return _DictNarrowingResolution(
+            suggested_type=schema,
+            is_fixable=False,
+            needs_literal_import=False,
+            matched_existing_td=False,
+            detail=f"Consider defining a TypedDict with fields: {schema}",
+        )
+    return None
+
+
+def _find_matching_typeddict(
+    shape: _DictShape,
+    module_name: str,
+    index: CodebaseIndex,
+) -> str | None:
+    """Return the unique in-scope TypedDict name matching `shape`, or None if 0 or >1 match."""
+    in_scope: dict[str, ClassInfo] = {
+        cls.name: cls
+        for cls in index.classes.values()
+        if cls.module_name == module_name and cls.is_typeddict
+    }
+    for local_name, target_qual in index.module_imports.get(module_name, {}).items():
+        target_cls = index.classes.get(target_qual)
+        if target_cls is not None and target_cls.is_typeddict:
+            in_scope[local_name] = target_cls
+
+    matches = [
+        name for name, td_cls in sorted(in_scope.items()) if _typeddict_matches_shape(td_cls, shape)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _typeddict_matches_shape(td_cls: ClassInfo, shape: _DictShape) -> bool:
+    """Return True if every observed key and value type satisfies `td_cls`'s TypedDict contract."""
+    if not td_cls.fields:
+        return False
+    field_map = {f.name: f for f in td_cls.fields}
+    if not set(shape.key_presence.keys()).issubset(field_map.keys()):
+        return False
+    for f in td_cls.fields:
+        if not f.is_not_required and shape.key_presence.get(f.name, 0) != shape.sample_count:
+            return False
+    return all(_typeddict_field_accepts_shape(field_map[key], shape) for key in shape.key_presence)
+
+
+def _typeddict_field_accepts_shape(field_info: FieldInfo, shape: _DictShape) -> bool:
+    """Return True if all observed value types for `field_info.name` match the declared field type."""
+    declared = _unwrap_typeddict_field_type(field_info)
+    if declared in _ANY_OR_OBJECT_TYPES:
+        return True
+    if field_info.name in shape.key_unknown:
+        return False
+    observed = shape.key_types.get(field_info.name, set())
+    if not observed:
+        return False
+    members = _parse_union_members(declared) or (declared,)
+    union_has_bool = any(m.strip() in {"bool", "builtins.bool"} for m in members)
+    union_has_int = any(m.strip() in {"int", "builtins.int"} for m in members)
+    return all(
+        any(
+            matches_union_member(
+                obs,
+                member,
+                union_has_bool=union_has_bool,
+                union_has_int=union_has_int,
+            )
+            for member in members
+        )
+        for obs in observed
+    )
+
+
+def _parse_union_members(type_str: str) -> tuple[str, ...] | None:
+    """Parse a type string as a top-level union if possible."""
+    try:
+        expr = cst.parse_expression(type_str)
+    except cst.ParserSyntaxError:
+        return None
+    return extract_union_members(cst.Annotation(annotation=expr))
+
+
+def _unwrap_typeddict_field_type(field_info: FieldInfo) -> str:
+    """Strip NotRequired[...] / Required[...] wrapper from a TypedDict field annotation."""
+    if field_info.not_required_inner is not None:
+        return field_info.not_required_inner
+    try:
+        expr = cst.parse_expression(field_info.annotation_str)
+    except cst.ParserSyntaxError:
+        return field_info.annotation_str
+    req_inner = extract_required_inner(cst.Annotation(annotation=expr))
+    return req_inner if req_inner is not None else field_info.annotation_str
+
+
+def _format_typeddict_suggestion(shape: _DictShape) -> str:
+    """Format a compact TypedDict schema preview showing required and NotRequired fields."""
+    parts: list[str] = []
+    for key in sorted(shape.key_presence):
+        if key in shape.key_unknown or not shape.key_types.get(key):
+            val_str = "Any"
+        else:
+            obs = shape.key_types[key]
+            ordered = sorted(t for t in obs if t != "None")
+            if "None" in obs:
+                ordered.append("None")
+            val_str = format_union_type(ordered)
+        if shape.key_presence[key] < shape.sample_count:
+            val_str = f"NotRequired[{val_str}]"
+        parts.append(f"{key!r}: {val_str}")
+    return f"TypedDict({{{', '.join(parts)}}})"
 
 
 def _rule_nt201_callsite_literal(
