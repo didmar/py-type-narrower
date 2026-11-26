@@ -55,16 +55,21 @@ Rules are split into two tiers by evidence strength:
 
 | Code | Tier | Description | Auto-fix (`fix`) |
 | :--- | :---: | :--- | :--- |
-| `NT101` | 1 (Local) | Parameter typed `str`/`int` is exhaustively guarded to literals in the function body (`if/elif/else raise`, negative guard + raise, `match`, or constant dict subscript) | Safe (default) |
+| `NT101` | 1 (Local) | Parameter typed `str`/`int` is exhaustively guarded to literals in the function body (`if/elif/else raise`, negative guard + raise, `match`, constant dict subscript, or `StrEnum`/`IntEnum` coercion) | Safe (default) |
 | `NT102` | 1 (Local) | Return type `T \| None` / `Optional[T]` never returns `None` along any path | Safe (default) |
-| `NT103` | 1 (Local) | Return type `str`/`int` only returns constant literals | Safe (default) |
-| `NT104` | 1 (Local) | Class attribute `T \| None` is always initialized non-`None` in `__init__` and never set to `None` | Safe (default) |
+| `NT103` | 1 (Local) | Return type `str`/`int` only returns constant literals or `StrEnum`/`IntEnum` members | Safe (default) |
+| `NT104` | 1 (Local) | Class attribute narrowed locally (`T \| None` always initialized non-`None`, `str`/`int` only assigned literals, or union with unused branch(es)) | Safe (default) |
 | `NT105` | 1 (Local) | Return union `A \| B \| C` has unused branch(es) | Safe (default) |
-| `NT201` | 2 (Whole-repo) | Parameter typed `str`/`int` only receives literals from a small set across all callers (also flags single-constant parameters) | Requires `--unsafe-fixes` |
-| `NT202` | 2 (Whole-repo) | Parameter typed `T \| None` never receives `None` across callers | Requires `--unsafe-fixes` |
-| `NT203` | 2 (Whole-repo) | Dataclass / `NamedTuple` field (`str`/`int` or `T \| None`) can be narrowed across instantiations and writes | Requires `--unsafe-fixes` |
-| `NT204` | 2 (Whole-repo) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
-| `NT205` | 2 (Whole-repo) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
+| `NT106` | 1 (Local) | Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal (`tuple[T1, T2]`) | Safe (default) |
+| `NT107` | 1 (Local) | Container or generator return (`list[T \| None]`, `dict[K, V \| None]`, `Iterator[T \| None]`, `Generator[T \| None, ...]`) never contains/yields `None` | Safe (default) |
+| `NT108` | 1 (Local) | Return type `Any` or `object` only returns concrete inferable type(s) | Safe (default) |
+| `NT109` | 1 (Local) | Structured `dict` return with constant string keys narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports a `TypedDict` schema | Safe when fixable |
+| `NT201` | 2 (Codebase) | Parameter typed `str`/`int` only receives literals from a small set or `StrEnum`/`IntEnum` members across callers (also flags single-constant parameters) | Requires `--unsafe-fixes` |
+| `NT202` | 2 (Codebase) | Parameter typed `T \| None` never receives `None` across callers | Requires `--unsafe-fixes` |
+| `NT203` | 2 (Codebase) | Dataclass, `NamedTuple`, `attrs`, Pydantic `BaseModel`, or `TypedDict` field (`str`/`int`, `T \| None`, or `NotRequired[T]`) can be narrowed across instantiations and writes | Requires `--unsafe-fixes` |
+| `NT204` | 2 (Codebase) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
+| `NT205` | 2 (Codebase) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
+| `NT206` | 2 (Codebase) | Call-site structured `dict` parameter narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports a `TypedDict` schema | Requires `--unsafe-fixes` when fixable |
 
 Narrowing automatically skips `@no_type_check` code, `Protocol`s, `ABC`s, `@abstractmethod`s, subclass overrides, overridden base-class return hooks, PEP 562 module hooks (`__getattr__`, `__dir__`), and fixed Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, `__getattr__`, etc.) to preserve Liskov substitution and runtime contracts.
 
@@ -131,13 +136,13 @@ min-call-sites = 2
 max-passes = 2
 verify = true
 verifier = "ty"
-select = ["NT101", "NT102", "NT103", "NT104", "NT105", "NT201", "NT202", "NT203", "NT204", "NT205"]
+select = ["NT101", "NT102", "NT103", "NT104", "NT105", "NT106", "NT107", "NT108", "NT109", "NT201", "NT202", "NT203", "NT204", "NT205", "NT206"]
 ignore = []
 ```
 
 ### Optional Flake8 Plugin
 
-Install with the `flake8` extra to expose Tier 1 (`NT101`–`NT105`) single-file rules directly in `flake8`:
+Install with the `flake8` extra to expose Tier 1 (`NT101`–`NT109`) single-file rules directly in `flake8`:
 
 ```bash
 pip install "py-type-narrower[flake8]"
