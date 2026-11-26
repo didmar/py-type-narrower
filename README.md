@@ -32,6 +32,7 @@ Running `py-type-narrower fix . --verify` narrows both annotations and adds the 
 ```python
 from typing import Literal
 
+
 # After
 def format_status(mode: Literal["long", "short"], code: int) -> str:
     if mode not in ("short", "long"):
