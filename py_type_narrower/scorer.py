@@ -157,8 +157,8 @@ def score_tier2_callsite_literal(ctx: CallSiteScoreContext) -> tuple[int, list[s
         notes.append("+10 body also compares against these literals")
 
     if ctx.only_test_callers:
-        score -= 20
-        notes.append("-20 only observed in test callers")
+        score -= 40
+        notes.append("-40 only observed in test callers")
 
     if ctx.call_count < ctx.min_call_sites:
         score -= 25
@@ -191,8 +191,8 @@ def score_tier2_unused_optional_param(ctx: OptionalParamScoreContext) -> tuple[i
         notes.append(f"-25 fewer than {ctx.min_call_sites} call sites")
 
     if ctx.only_test_callers:
-        score -= 20
-        notes.append("-20 only observed in test callers")
+        score -= 40
+        notes.append("-40 only observed in test callers")
 
     if ctx.has_none_default:
         score -= 5
@@ -221,8 +221,8 @@ def score_tier2_constant_bool_param(ctx: ConstantBoolScoreContext) -> tuple[int,
         notes.append(f"-25 fewer than {ctx.min_call_sites} call sites")
 
     if ctx.only_test_callers:
-        score -= 20
-        notes.append("-20 only observed in test callers")
+        score -= 40
+        notes.append("-40 only observed in test callers")
 
     if ctx.has_default:
         score -= 5

@@ -281,12 +281,15 @@ def discover_python_files(paths: list[Path], exclude: list[str]) -> list[Path]:
 
 
 def _is_excluded(file_path: Path, base: Path, exclude_set: set[str]) -> bool:
-    """Return True if any relative path component matches the exclude list."""
+    """Return True if any relative path component is hidden or matches the exclude list."""
     try:
         rel_parts = file_path.relative_to(base).parts
     except ValueError:
         rel_parts = file_path.parts
-    return any(part in exclude_set for part in rel_parts)
+    return any(
+        part in exclude_set or (part.startswith(".") and part not in {".", ".."})
+        for part in rel_parts[:-1]
+    ) or (bool(rel_parts) and rel_parts[-1] in exclude_set)
 
 
 def _read_source(path: Path, overrides: dict[Path, str] | None) -> str | None:
@@ -454,7 +457,12 @@ class _DefinitionCollector(cst.CSTVisitor):
         if _has_decorator(node, {"no_type_check"}):
             return False
         pos = self.get_metadata(PositionProvider, node.name)
-        bases = [expr_to_code(arg.value) for arg in node.bases]
+        bases = [
+            expr_to_code(arg.value.value)
+            if isinstance(arg.value, cst.Subscript)
+            else expr_to_code(arg.value)
+            for arg in node.bases
+        ]
         is_proto_abc = any(base in ABSTRACT_BASE_NAMES for base in bases)
         is_dataclass, is_kw_only_dc = _inspect_dataclass_decorator(node)
         is_attrs, is_kw_only_attrs = _inspect_attrs_decorator(node)
@@ -743,7 +751,7 @@ def _index_module_definitions(
     resolved = path.resolve()
     try:
         module = cst.parse_module(source)
-    except cst.ParserSyntaxError as exc:
+    except (cst.ParserSyntaxError, cst.CSTLogicError, cst.CSTValidationError) as exc:
         logger.warning("Skipping file with syntax error %s: %s", path, exc)
         return None
 

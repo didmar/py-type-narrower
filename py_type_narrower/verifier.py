@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -58,7 +59,7 @@ class _BisectContext:
     project_root: Path
     adapter: TypeCheckerAdapter
     python_exe: Path | None
-    baseline_sigs: set[tuple[str, int, str, str]]
+    baseline_counts: Counter[tuple[str, str, str]]
 
 
 def verify_candidates(
@@ -85,7 +86,9 @@ def verify_candidates(
         project_root=project_root,
         adapter=adapter,
         python_exe=python_exe,
-        baseline_sigs={d.signature() for d in baseline},
+        baseline_counts=Counter(
+            (d.file, d.rule, d.message) for d in baseline if d.severity == "error"
+        ),
     )
 
     verified: list[NarrowingCandidate] = []
@@ -109,9 +112,7 @@ def _bisect_verify(
         ctx.python_exe,
         source_paths=ctx.sources.keys(),
     )
-    new_errors = [
-        d for d in diags if d.severity == "error" and d.signature() not in ctx.baseline_sigs
-    ]
+    new_errors = _find_new_errors(diags, ctx.baseline_counts)
 
     if not new_errors:
         for cand in candidates:
@@ -129,6 +130,24 @@ def _bisect_verify(
     mid = len(candidates) // 2
     _bisect_verify(candidates[:mid], ctx, verified, rejected)
     _bisect_verify(candidates[mid:], ctx, verified, rejected)
+
+
+def _find_new_errors(
+    diags: set[CheckerDiagnostic],
+    baseline_counts: Counter[tuple[str, str, str]],
+) -> list[CheckerDiagnostic]:
+    """Return error diagnostics exceeding baseline counts (tolerant of import line shifts)."""
+    remaining = Counter(baseline_counts)
+    new_errors: list[CheckerDiagnostic] = []
+    for diag in sorted(diags, key=lambda d: (d.file, d.line, d.col, d.rule, d.message)):
+        if diag.severity != "error":
+            continue
+        key = (diag.file, diag.rule, diag.message)
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            new_errors.append(diag)
+    return new_errors
 
 
 def _run_check_in_shadow(

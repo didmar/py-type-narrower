@@ -580,10 +580,12 @@ def _nt104_literal_attr_candidate(
         or _has_prose_or_overlong_literal(matching)
     ):
         return None
-    # Avoid narrowing a public mutable field initialized to a single sentinel (e.g. `title: str = ""`)
-    # unless the attribute is private, closed-world is enabled, or multiple states are observed.
+    # Avoid narrowing a single-constant `int` attribute (often a sentinel like `-1`/`0` mutated by
+    # friend classes), or a public mutable attribute initialized to a single sentinel in open-world.
     is_attr_private = fact.name.startswith("_") or cls.is_private
-    if len(matching) == 1 and not is_attr_private and not config.closed_world:
+    if len(matching) == 1 and (
+        fact.primitive_kind == "int" or (not is_attr_private and not config.closed_world)
+    ):
         return None
 
     suggested = format_literal_type(matching)
