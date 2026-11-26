@@ -244,3 +244,27 @@ class SysCapture(CaptureBase):
     nt201 = [c for c in cands if c.code == RuleCode.NT201 and c.target_name == "op"]
     assert len(nt201) == 1
     assert nt201[0].suggested_type == 'Literal["done", "snap", "start"]'
+
+
+def test_tier2_resolves_optional_and_generic_method_receivers(tmp_path: Path) -> None:
+    mod = tmp_path / "hooks.py"
+    mod.write_text(
+        """class HookManager:
+    def try_emit(self, event: str) -> None:
+        _ = event
+
+def run(hooks: HookManager | None = None) -> None:
+    hooks = hooks or HookManager()
+    hooks.try_emit("pre_lock")
+    hooks.try_emit("post_lock")
+
+def run_other(hooks: HookManager) -> None:
+    hooks.try_emit("pre_install")
+""",
+        encoding="utf-8",
+    )
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    nt201 = [c for c in cands if c.code == RuleCode.NT201 and c.target_name == "event"]
+    assert len(nt201) == 1
+    assert nt201[0].suggested_type == 'Literal["post_lock", "pre_install", "pre_lock"]'

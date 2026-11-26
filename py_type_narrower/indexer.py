@@ -1150,7 +1150,7 @@ class _CallSiteCollector(cst.CSTVisitor):
             ann = p.annotation
             lits = extract_literal_values_from_annotation(ann)
             ann_str = expr_to_code(ann.annotation) if ann is not None else None
-            class_ref = ann_str.strip("'\"") if ann_str is not None else None
+            class_ref = _extract_class_ref(ann)
             is_non_none = (
                 ann is not None and extract_optional_inner(ann) is None and ann_str != "None"
             )
@@ -1437,17 +1437,13 @@ class _CallSiteCollector(cst.CSTVisitor):
         val_non_none = value is not None and is_definitely_non_none_expr(value)
         val_type = infer_simple_expr_type(value) if value is not None else None
 
-        class_type = ann_str
-        if (
-            class_type is None
-            and value is not None
-            and self._is_known_class_ctor_call(value)
-            and isinstance(value, cst.Call)
-            and isinstance(value.func, cst.Name)
-        ):
-            class_type = value.func.value
-            val_type = value.func.value
-            val_non_none = True
+        class_type = _extract_class_ref(annotation)
+        ctor_name = self._extract_ctor_class_name(value) if value is not None else None
+        if class_type is None and ctor_name is not None:
+            class_type = ctor_name
+            if isinstance(value, cst.Call):
+                val_type = ctor_name
+                val_non_none = True
 
         inferred_type = ann_str or val_type
         existing = scope.get(var_name)
@@ -1786,6 +1782,18 @@ class _CallSiteCollector(cst.CSTVisitor):
                 return imported_cls
         return None
 
+    def _extract_ctor_class_name(self, expr: cst.BaseExpression) -> str | None:
+        """Return class name from `Cls(...)` or `x or Cls(...)` when `Cls` is a known class."""
+        if (
+            isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+            and self._is_known_class_ctor_call(expr)
+        ):
+            return expr.func.value
+        if isinstance(expr, cst.BooleanOperation) and isinstance(expr.operator, cst.Or):
+            return self._extract_ctor_class_name(expr.right)
+        return None
+
     def _is_known_class_ctor_call(self, expr: cst.BaseExpression) -> bool:
         """Return True if expr is a direct call to an indexed class constructor."""
         if not isinstance(expr, cst.Call) or not isinstance(expr.func, cst.Name):
@@ -1795,6 +1803,19 @@ class _CallSiteCollector(cst.CSTVisitor):
             self.ctx.imports.get(expr.func.value, ""),
         }
         return any(c in self.index.classes for c in cls_candidates)
+
+
+def _extract_class_ref(annotation: cst.Annotation | None) -> str | None:
+    """Extract a bare class reference from `T`, `'T'`, `T | None`, `Optional[T]`, or `T[X]`."""
+    if annotation is None:
+        return None
+    inner = extract_optional_inner(annotation)
+    raw = inner if inner is not None else expr_to_code(annotation.annotation)
+    cleaned = raw.strip().strip("'\"")
+    bracket = cleaned.find("[")
+    if bracket != -1:
+        cleaned = cleaned[:bracket].strip()
+    return cleaned or None
 
 
 def _collect_indexed_ancestors(
