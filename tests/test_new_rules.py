@@ -305,3 +305,45 @@ def main() -> None:
     nt201 = [c for c in cands if c.code == RuleCode.NT201]
     assert len(nt201) == 1
     assert nt201[0].suggested_type == 'Literal["fast", "slow"]'
+
+
+def test_nt106_fixed_tuple_returns(tmp_path: Path) -> None:
+    code = """from typing import Any
+
+def coords(x: int, y: int) -> tuple[int, ...]:
+    return (x, y)
+
+def labeled(flag: bool) -> tuple[str | int, ...]:
+    if flag:
+        return ("a", 1)
+    return ("b", 2)
+
+def pair_any() -> tuple[Any, ...]:
+    return ("ok", 42)
+
+def variable_len(flag: bool) -> tuple[int, ...]:
+    if flag:
+        return (1, 2)
+    return (1, 2, 3)
+
+def starred(xs: list[int]) -> tuple[int, ...]:
+    return (*xs, 1)
+
+def empty() -> tuple[int, ...]:
+    return ()
+"""
+    mod = tmp_path / "tuples.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt106 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT106}
+
+    assert set(nt106.keys()) == {"coords", "labeled", "pair_any"}
+    assert nt106["coords"].suggested_type == "tuple[int, int]"
+    assert nt106["labeled"].suggested_type == "tuple[str, int]"
+    assert nt106["pair_any"].suggested_type == "tuple[str, int]"
+
+    rewritten = rewrite_module_source(code, list(nt106.values()))
+    assert "def coords(x: int, y: int) -> tuple[int, int]:" in rewritten
+    assert "def labeled(flag: bool) -> tuple[str, int]:" in rewritten
+    assert "def pair_any() -> tuple[str, int]:" in rewritten

@@ -202,6 +202,35 @@ def _matches_numeric_tower(
 _MIN_UNION_MEMBERS = 2
 
 
+def extract_variadic_tuple_element(annotation_str: str | None) -> tuple[str, str] | None:
+    """If annotation is `tuple[T, ...]` or `Tuple[T, ...]`, return `(outer, elem_type)`."""
+    expr = _parse_subscript_annotation(annotation_str)
+    if expr is None or len(expr.slice) != _MIN_UNION_MEMBERS:
+        return None
+    base_name = _annotation_simple_name(expr.value)
+    if base_name not in {"tuple", "builtins.tuple", "Tuple", "typing.Tuple"}:
+        return None
+    first, second = expr.slice[0].slice, expr.slice[1].slice
+    if (
+        isinstance(first, cst.Index)
+        and isinstance(second, cst.Index)
+        and isinstance(second.value, cst.Ellipsis)
+    ):
+        return (expr_to_code(expr.value), expr_to_code(first.value))
+    return None
+
+
+def _parse_subscript_annotation(annotation_str: str | None) -> cst.Subscript | None:
+    """Parse a type annotation string and return it if it is a Subscript expression."""
+    if annotation_str is None:
+        return None
+    try:
+        expr = cst.parse_expression(annotation_str)
+    except cst.ParserSyntaxError:
+        return None
+    return expr if isinstance(expr, cst.Subscript) else None
+
+
 def extract_union_members(annotation: cst.Annotation | None) -> tuple[str, ...] | None:
     """Extract top-level union member strings from `A | B`, `Union[A, B]`, or `Optional[T]`."""
     if annotation is None:

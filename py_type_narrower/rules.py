@@ -11,6 +11,7 @@ from py_type_narrower.body_analysis import filter_literals_by_kind
 from py_type_narrower.cst_utils import (
     ExtractedLiteral,
     extract_union_members,
+    extract_variadic_tuple_element,
     format_literal_type,
     format_union_type,
     matches_union_member,
@@ -28,6 +29,7 @@ from py_type_narrower.scorer import (
     ConstantBoolScoreContext,
     OptionalParamScoreContext,
     score_tier1_always_initialized_attr,
+    score_tier1_fixed_tuple_return,
     score_tier1_guarded_param,
     score_tier1_literal_return,
     score_tier1_unused_optional_return,
@@ -168,6 +170,7 @@ def _run_tier1_function_rules(
         (RuleCode.NT105, _rule_nt105_unused_union_return),
         (RuleCode.NT102, _rule_nt102_unused_optional_return),
         (RuleCode.NT103, _rule_nt103_literal_return),
+        (RuleCode.NT106, _rule_nt106_fixed_tuple_return),
     )
     seen_targets: set[tuple[TargetKind, str | None]] = set()
     for code, rule_fn in rules:
@@ -496,6 +499,103 @@ def _rule_nt105_unused_union_return(
             is_public=not func.is_private,
         )
     ]
+
+
+_MAX_FIXED_TUPLE_LEN = 6
+_ANY_OR_OBJECT_TYPES: frozenset[str] = frozenset({"Any", "typing.Any", "object", "builtins.object"})
+
+
+def _rule_nt106_fixed_tuple_return(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+) -> list[NarrowingCandidate]:
+    """NT106: Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal."""
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+        return []
+    parsed = extract_variadic_tuple_element(func.return_annotation_str)
+    if parsed is None:
+        return []
+    outer_name, elem_type_str = parsed
+    ret = func.body_facts.returns
+    if (
+        ret.is_stub
+        or ret.is_generator
+        or not ret.has_returns
+        or ret.can_fallthrough
+        or not ret.all_returns_fixed_tuple
+        or ret.fixed_tuple_len is None
+        or not (1 <= ret.fixed_tuple_len <= _MAX_FIXED_TUPLE_LEN)
+    ):
+        return []
+
+    slot_types = _resolve_fixed_tuple_slot_types(
+        elem_type_str,
+        ret.fixed_tuple_len,
+        ret.fixed_tuple_slot_types,
+        ret.fixed_tuple_slot_unknown,
+    )
+    suggested = f"{outer_name}[{', '.join(slot_types)}]"
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT106,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=suggested,
+            needs_literal_import=False,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but every return yields a {ret.fixed_tuple_len}-tuple; narrow to `{suggested}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="fixed_tuple_return",
+                    detail=f"All return paths yield a {ret.fixed_tuple_len}-element tuple literal",
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_fixed_tuple_return(is_private=func.is_private),
+            is_public=not func.is_private,
+        )
+    ]
+
+
+def _resolve_fixed_tuple_slot_types(
+    elem_type_str: str,
+    tuple_len: int,
+    slot_types: list[set[str]],
+    slot_unknown: list[bool],
+) -> list[str]:
+    """Compute per-slot types for a fixed-length tuple narrowed from `tuple[elem_type_str, ...]`."""
+    union_members = _parse_union_members(elem_type_str)
+    is_broad = elem_type_str.strip() in _ANY_OR_OBJECT_TYPES
+    resolved: list[str] = []
+    for idx in range(tuple_len):
+        obs = slot_types[idx]
+        unknown = slot_unknown[idx]
+        if union_members is not None and not unknown and obs:
+            used, _unused = _partition_union_members(union_members, obs)
+            resolved.append(format_union_type(used) if used else elem_type_str)
+        elif is_broad and not unknown and obs:
+            resolved.append(format_union_type(sorted(obs)))
+        else:
+            resolved.append(elem_type_str)
+    return resolved
+
+
+def _parse_union_members(type_str: str) -> tuple[str, ...] | None:
+    """Parse a type string as a top-level union if possible."""
+    try:
+        expr = cst.parse_expression(type_str)
+    except cst.ParserSyntaxError:
+        return None
+    return extract_union_members(cst.Annotation(annotation=expr))
 
 
 def _rule_nt201_callsite_literal(

@@ -32,6 +32,10 @@ class ReturnSummary:
     returned_literals: set[ExtractedLiteral] = field(default_factory=set)
     returned_types: set[str] = field(default_factory=set)
     has_unknown_return_type: bool = False
+    all_returns_fixed_tuple: bool = True
+    fixed_tuple_len: int | None = None
+    fixed_tuple_slot_types: list[set[str]] = field(default_factory=list)
+    fixed_tuple_slot_unknown: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -375,6 +379,10 @@ class _ReturnCollector(cst.CSTVisitor):
         self.returned_literals: set[ExtractedLiteral] = set()
         self.returned_types: set[str] = set()
         self.has_unknown_return_type = False
+        self.all_returns_fixed_tuple = True
+        self.fixed_tuple_len: int | None = None
+        self.fixed_tuple_slot_types: list[set[str]] = []
+        self.fixed_tuple_slot_unknown: list[bool] = []
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
         return False
@@ -392,6 +400,7 @@ class _ReturnCollector(cst.CSTVisitor):
             self.returns_none = True
             self.all_returns_non_none = False
             self.has_non_literal_return = True
+            self.all_returns_fixed_tuple = False
             self.returned_types.add("None")
             return False
 
@@ -404,12 +413,45 @@ class _ReturnCollector(cst.CSTVisitor):
         else:
             self.returned_types.update(inferred)
 
+        self._record_fixed_tuple(node.value)
+
         lit = extract_literal(node.value)
         if lit is not None:
             self.returned_literals.add(lit)
         else:
             self.has_non_literal_return = True
         return False
+
+    def _record_fixed_tuple(self, expr: cst.BaseExpression) -> None:
+        """Track fixed-length tuple literal returns and per-slot inferred types."""
+        if not self.all_returns_fixed_tuple:
+            return
+        if isinstance(expr, cst.IfExp):
+            self._record_fixed_tuple(expr.body)
+            self._record_fixed_tuple(expr.orelse)
+            return
+        if not isinstance(expr, cst.Tuple) or not expr.elements:
+            self.all_returns_fixed_tuple = False
+            return
+        if any(isinstance(el, cst.StarredElement) for el in expr.elements):
+            self.all_returns_fixed_tuple = False
+            return
+        length = len(expr.elements)
+        if self.fixed_tuple_len is None:
+            self.fixed_tuple_len = length
+            self.fixed_tuple_slot_types = [set() for _ in range(length)]
+            self.fixed_tuple_slot_unknown = [False] * length
+        elif self.fixed_tuple_len != length:
+            self.all_returns_fixed_tuple = False
+            return
+        for idx, elem in enumerate(expr.elements):
+            slot_inferred = _infer_expr_types_in_scope(
+                elem.value, self.local_types, self.known_class_names
+            )
+            if slot_inferred is None:
+                self.fixed_tuple_slot_unknown[idx] = True
+            else:
+                self.fixed_tuple_slot_types[idx].update(slot_inferred)
 
 
 def _analyze_returns(
@@ -443,6 +485,10 @@ def _analyze_returns(
     summary.returned_literals = collector.returned_literals
     summary.returned_types = collector.returned_types
     summary.has_unknown_return_type = collector.has_unknown_return_type
+    summary.all_returns_fixed_tuple = collector.all_returns_fixed_tuple
+    summary.fixed_tuple_len = collector.fixed_tuple_len
+    summary.fixed_tuple_slot_types = collector.fixed_tuple_slot_types
+    summary.fixed_tuple_slot_unknown = collector.fixed_tuple_slot_unknown
     summary.can_fallthrough = not _block_always_terminates(stmts)
     return summary
 
