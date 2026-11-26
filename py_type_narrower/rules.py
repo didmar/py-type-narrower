@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from py_type_narrower.body_analysis import ReturnSummary
+    from py_type_narrower.body_analysis import ParamGuardInfo, ReturnSummary
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
         ClassInfo,
@@ -62,9 +62,9 @@ if TYPE_CHECKING:
         ParamInfo,
     )
 
-    Tier1FunctionRule = Callable[[FunctionInfo, NarrowerConfig], list[NarrowingCandidate]]
+    Tier1FunctionRule = Callable[[FunctionInfo, "_RuleEvalContext"], list[NarrowingCandidate]]
     Tier2ParamRule = Callable[
-        [FunctionInfo, ParamInfo, ParamCallStats, NarrowerConfig],
+        [FunctionInfo, ParamInfo, ParamCallStats, "_RuleEvalContext"],
         NarrowingCandidate | None,
     ]
 
@@ -186,18 +186,17 @@ def _run_tier1_function_rules(
         (RuleCode.NT106, _rule_nt106_fixed_tuple_return),
         (RuleCode.NT107, _rule_nt107_container_non_none_return),
         (RuleCode.NT108, _rule_nt108_concrete_any_return),
+        (RuleCode.NT109, _rule_nt109_structured_dict_return),
     )
     seen_targets: set[tuple[TargetKind, str | None]] = set()
     for code, rule_fn in rules:
         if code not in ctx.active:
             continue
-        for cand in rule_fn(func, ctx.config):
+        for cand in rule_fn(func, ctx):
             target = (cand.target_kind, cand.target_name)
             if target not in seen_targets:
                 seen_targets.add(target)
                 out.append(cand)
-    if RuleCode.NT109 in ctx.active and (TargetKind.RETURN, None) not in seen_targets:
-        out.extend(_rule_nt109_structured_dict_return(func, ctx.index, ctx.config))
 
 
 def _run_tier2_function_rules(
@@ -236,21 +235,20 @@ def _evaluate_param_tier2(
         (RuleCode.NT204, _rule_nt204_unused_union_param),
         (RuleCode.NT202, _rule_nt202_unused_optional_param),
         (RuleCode.NT205, _rule_nt205_constant_bool_param),
+        (RuleCode.NT206, _rule_nt206_callsite_structured_dict),
     )
     for code, rule_fn in rules:
         if code not in ctx.active:
             continue
-        cand = rule_fn(func, param, stats, ctx.config)
+        cand = rule_fn(func, param, stats, ctx)
         if cand is not None:
             return cand
-    if RuleCode.NT206 in ctx.active:
-        return _rule_nt206_callsite_structured_dict(func, param, stats, ctx.index, ctx.config)
     return None
 
 
 def _rule_nt101_guarded_params(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT101: Parameter typed str/int is exhaustively guarded to specific literals in body."""
     if _skip_param_narrowing_for_hierarchy(func):
@@ -261,10 +259,10 @@ def _rule_nt101_guarded_params(
         if param.primitive_kind is None:
             continue
         guard = func.body_facts.param_guards.get(param.name)
-        if guard is None or not guard.strict_literals:
+        if guard is None:
             continue
-        matching = filter_literals_by_kind(guard.strict_literals, param.primitive_kind)
-        if not matching or len(matching) > config.max_literals:
+        matching, reasons = _collect_guarded_literals_for_param(func, param, guard, ctx.index)
+        if not matching or len(matching) > ctx.config.max_literals:
             continue
         if param.has_default and param.default_literal is not None:
             if param.default_literal.kind == param.primitive_kind:
@@ -275,7 +273,7 @@ def _rule_nt101_guarded_params(
         suggested = format_literal_type(matching)
         evidence = [
             EvidenceItem(kind="body_guard", detail=reason, file=func.file, line=func.line)
-            for reason in guard.strict_evidence
+            for reason in reasons
         ]
         results.append(
             NarrowingCandidate(
@@ -303,15 +301,42 @@ def _rule_nt101_guarded_params(
     return results
 
 
+def _collect_guarded_literals_for_param(
+    func: FunctionInfo,
+    param: ParamInfo,
+    guard: ParamGuardInfo,
+    index: CodebaseIndex,
+) -> tuple[set[ExtractedLiteral], list[str]]:
+    """Combine explicit body-guard literals with values from in-scope StrEnum/IntEnum coercions."""
+    if param.primitive_kind is None:
+        return (set(), [])
+    matching = set(filter_literals_by_kind(guard.strict_literals, param.primitive_kind))
+    reasons = list(guard.strict_evidence)
+    if matching:
+        return (matching, reasons)
+
+    in_scope_enums = _in_scope_enums(func.module_name, index)
+    for callee in sorted(guard.coerced_enum_names):
+        enum_cls = in_scope_enums.get(callee)
+        if (
+            enum_cls is not None
+            and enum_cls.enum_kind == param.primitive_kind
+            and enum_cls.enum_values
+        ):
+            matching.update(enum_cls.enum_values)
+            reasons.append(f"Coerced via `{callee}({param.name})`")
+    return (matching, reasons)
+
+
 def _rule_nt102_unused_optional_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT102: Return type `T | None` never returns `None` along any path."""
     if (
         func.return_optional_inner is None
         or func.return_annotation_str is None
-        or _skip_return_narrowing_for_protocol(func, config)
+        or _skip_return_narrowing_for_protocol(func, ctx.config)
     ):
         return []
     ret = func.body_facts.returns
@@ -353,36 +378,37 @@ def _rule_nt102_unused_optional_return(
 
 def _rule_nt103_literal_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
-    """NT103: Return type `str`/`int` only returns constant literals."""
+    """NT103: Return type `str`/`int` only returns constant literals or members of an Enum."""
     ret = func.body_facts.returns
     if (
         func.return_primitive_kind is None
         or func.return_annotation_str is None
         or func.is_override
-        or _skip_return_narrowing_for_protocol(func, config)
-    ):
-        return []
-    if (
-        ret.is_stub
+        or _skip_return_narrowing_for_protocol(func, ctx.config)
+        or ret.is_stub
         or ret.is_generator
         or not ret.has_returns
         or ret.can_fallthrough
-        or ret.has_non_literal_return
-        or not ret.returned_literals
     ):
+        return []
+
+    enum_cand = _try_enum_member_return_candidate(func, ctx)
+    if enum_cand is not None:
+        return [enum_cand]
+
+    if ret.has_non_literal_return or not ret.returned_literals:
         return []
 
     matching = filter_literals_by_kind(ret.returned_literals, func.return_primitive_kind)
     if (
         len(matching) != len(ret.returned_literals)
         or not matching
-        or len(matching) > config.max_literals
+        or len(matching) > ctx.config.max_literals
         or _has_prose_or_overlong_literal(matching)
+        or (len(matching) == 1 and func.in_external_subclass and not func.is_private)
     ):
-        return []
-    if len(matching) == 1 and func.in_external_subclass and not func.is_private:
         return []
 
     suggested = format_literal_type(matching)
@@ -412,12 +438,67 @@ def _rule_nt103_literal_return(
                 )
             ],
             score=score_tier1_literal_return(
-                is_private=func.is_private, closed_world=config.closed_world
+                is_private=func.is_private, closed_world=ctx.config.closed_world
             ),
             is_public=not func.is_private,
             is_single_constant=len(matching) == 1,
         )
     ]
+
+
+def _try_enum_member_return_candidate(
+    func: FunctionInfo,
+    ctx: _RuleEvalContext,
+) -> NarrowingCandidate | None:
+    """Narrow `-> str` / `-> int` to an in-scope StrEnum/IntEnum when all returns are its members."""
+    ret = func.body_facts.returns
+    if (
+        not ret.all_returns_enum_attr
+        or not ret.returned_enum_attrs
+        or func.return_annotation_str is None
+    ):
+        return None
+    cls_names = {cls_name for cls_name, _member in ret.returned_enum_attrs}
+    if len(cls_names) != 1:
+        return None
+    enum_name = next(iter(cls_names))
+    enum_cls = _in_scope_enums(func.module_name, ctx.index).get(enum_name)
+    if enum_cls is None or enum_cls.enum_kind != func.return_primitive_kind:
+        return None
+    if not all(member in enum_cls.enum_members for _cls, member in ret.returned_enum_attrs):
+        return None
+    if len(ret.returned_enum_attrs) == 1 and func.in_external_subclass and not func.is_private:
+        return None
+
+    return NarrowingCandidate(
+        code=RuleCode.NT103,
+        tier=Tier.LOCAL,
+        file=func.file,
+        line=func.return_line,
+        col=func.return_col,
+        symbol=func.qualname,
+        target_kind=TargetKind.RETURN,
+        target_name=None,
+        current_type=func.return_annotation_str,
+        suggested_type=enum_name,
+        needs_literal_import=False,
+        message=(
+            f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+            f"but every return yields a `{enum_name}` enum member"
+        ),
+        evidence=[
+            EvidenceItem(
+                kind="return_enum_members",
+                detail=f"All return statements yield members of `{enum_name}`",
+                file=func.file,
+                line=func.line,
+            )
+        ],
+        score=score_tier1_literal_return(
+            is_private=func.is_private, closed_world=ctx.config.closed_world
+        ),
+        is_public=not func.is_private,
+    )
 
 
 def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandidate]:
@@ -461,7 +542,7 @@ def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandid
 
 def _rule_nt105_unused_union_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT105: Return union `A | B | C` has unused non-None branch(es)."""
     members = func.return_union_members
@@ -469,7 +550,7 @@ def _rule_nt105_unused_union_return(
     if (
         members is None
         or func.return_annotation_str is None
-        or _skip_return_narrowing_for_protocol(func, config)
+        or _skip_return_narrowing_for_protocol(func, ctx.config)
         or ret.is_stub
         or ret.is_generator
         or not ret.has_returns
@@ -523,10 +604,10 @@ _ANY_OR_OBJECT_TYPES: frozenset[str] = frozenset({"Any", "typing.Any", "object",
 
 def _rule_nt106_fixed_tuple_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT106: Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal."""
-    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, ctx.config):
         return []
     parsed = extract_variadic_tuple_element(func.return_annotation_str)
     if parsed is None:
@@ -607,10 +688,10 @@ def _resolve_fixed_tuple_slot_types(
 
 def _rule_nt107_container_non_none_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT107: Container/generator return `list[T | None]` / `Iterator[T | None]` never yields None."""
-    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, ctx.config):
         return []
     spec = extract_optional_container_return(func.return_annotation_str)
     if spec is None:
@@ -681,13 +762,13 @@ _MAX_ANY_RETURN_UNION_MEMBERS = 3
 
 def _rule_nt108_concrete_any_return(
     func: FunctionInfo,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT108: Return type `Any` / `object` only returns concrete inferable type(s)."""
     if (
         func.return_annotation_str is None
         or func.return_annotation_str.strip() not in _ANY_OR_OBJECT_TYPES
-        or _skip_return_narrowing_for_protocol(func, config)
+        or _skip_return_narrowing_for_protocol(func, ctx.config)
     ):
         return []
     ret = func.body_facts.returns
@@ -766,11 +847,10 @@ _MAX_TYPEDDICT_KEYS = 12
 
 def _rule_nt109_structured_dict_return(
     func: FunctionInfo,
-    index: CodebaseIndex,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT109: Structured dict return narrows to an existing TypedDict, dict[Literal, V], or TypedDict schema."""
-    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, ctx.config):
         return []
     dict_spec = extract_str_key_dict_annotation(func.return_annotation_str)
     if dict_spec is None:
@@ -797,8 +877,8 @@ def _rule_nt109_structured_dict_return(
         dict_spec=dict_spec,
         shape=shape,
         module_name=func.module_name,
-        index=index,
-        max_literals=config.max_literals,
+        index=ctx.index,
+        max_literals=ctx.config.max_literals,
     )
     if resolution is None:
         return []
@@ -842,8 +922,7 @@ def _rule_nt206_callsite_structured_dict(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    index: CodebaseIndex,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
     """NT206: Call-site structured dict parameter narrows to TypedDict or dict[Literal, V]."""
     dict_spec = extract_str_key_dict_annotation(param.annotation_str)
@@ -860,8 +939,8 @@ def _rule_nt206_callsite_structured_dict(
         dict_spec=dict_spec,
         shape=shape,
         module_name=func.module_name,
-        index=index,
-        max_literals=config.max_literals,
+        index=ctx.index,
+        max_literals=ctx.config.max_literals,
     )
     if resolution is None:
         return None
@@ -869,9 +948,9 @@ def _rule_nt206_callsite_structured_dict(
     score, notes = score_tier2_unused_optional_param(
         OptionalParamScoreContext(
             is_private=func.is_private,
-            closed_world=config.closed_world,
+            closed_world=ctx.config.closed_world,
             call_count=len(stats.observations),
-            min_call_sites=config.min_call_sites,
+            min_call_sites=ctx.config.min_call_sites,
             only_test_callers=all(o.is_test_caller for o in stats.observations),
             has_none_default=False,
         )
@@ -1094,11 +1173,15 @@ def _rule_nt201_callsite_literal(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
-    """NT201: Call-site `str`/`int` parameter only receives literals from a small set."""
+    """NT201: Call-site `str`/`int` parameter only receives literals or members of an Enum."""
     if param.primitive_kind is None or param.annotation_str is None:
         return None
+
+    enum_cand = _try_callsite_enum_candidate(func, param, stats, ctx)
+    if enum_cand is not None:
+        return enum_cand
 
     collected_counts = _collect_literal_counts(
         stats=stats,
@@ -1112,7 +1195,7 @@ def _rule_nt201_callsite_literal(
     unique_lits = set(collected_counts.keys())
     if (
         not unique_lits
-        or len(unique_lits) > config.max_literals
+        or len(unique_lits) > ctx.config.max_literals
         or _has_prose_or_overlong_literal(unique_lits)
     ):
         return None
@@ -1125,10 +1208,10 @@ def _rule_nt201_callsite_literal(
     score, notes = score_tier2_callsite_literal(
         CallSiteScoreContext(
             is_private=func.is_private,
-            closed_world=config.closed_world,
+            closed_world=ctx.config.closed_world,
             call_count=total_calls,
             unique_value_count=len(unique_lits),
-            min_call_sites=config.min_call_sites,
+            min_call_sites=ctx.config.min_call_sites,
             only_test_callers=only_test,
             has_body_corroboration=has_body_corr,
             param_name=param.name,
@@ -1163,11 +1246,86 @@ def _rule_nt201_callsite_literal(
     )
 
 
+def _try_callsite_enum_candidate(
+    func: FunctionInfo,
+    param: ParamInfo,
+    stats: ParamCallStats,
+    ctx: _RuleEvalContext,
+) -> NarrowingCandidate | None:
+    """Narrow `param: str/int` to an in-scope StrEnum/IntEnum when all callers pass its members."""
+    if param.annotation_str is None or param.has_default:
+        return None
+    enum_quals = {obs.enum_qualname for obs in stats.observations}
+    if len(enum_quals) != 1 or None in enum_quals:
+        return None
+    target_qual = next(iter(enum_quals))
+    in_scope = _in_scope_enums(func.module_name, ctx.index)
+    visible_matches = [
+        name
+        for name, cls in sorted(in_scope.items())
+        if cls.qualname == target_qual and cls.enum_kind == param.primitive_kind
+    ]
+    if len(visible_matches) != 1:
+        return None
+    enum_name = visible_matches[0]
+    total_calls = len(stats.observations) + stats.omitted_count
+    score, notes = score_tier2_unused_optional_param(
+        OptionalParamScoreContext(
+            is_private=func.is_private,
+            closed_world=ctx.config.closed_world,
+            call_count=total_calls,
+            min_call_sites=ctx.config.min_call_sites,
+            only_test_callers=all(o.is_test_caller for o in stats.observations),
+            has_none_default=False,
+        )
+    )
+    return NarrowingCandidate(
+        code=RuleCode.NT201,
+        tier=Tier.WHOLE_REPO,
+        file=func.file,
+        line=param.line,
+        col=param.col,
+        symbol=func.qualname,
+        target_kind=TargetKind.PARAMETER,
+        target_name=param.name,
+        current_type=param.annotation_str,
+        suggested_type=enum_name,
+        needs_literal_import=False,
+        message=(
+            f"Parameter `{param.name}` in `{func.name}` only receives `{enum_name}` "
+            f"enum values across {total_calls} call(s)"
+        ),
+        evidence=[
+            EvidenceItem(
+                kind="callsite_enum",
+                detail=f"All {total_calls} call(s) pass `{enum_name}` enum values",
+            ),
+            *(EvidenceItem(kind="score_factor", detail=note) for note in notes),
+        ],
+        score=score,
+        is_public=not func.is_private,
+    )
+
+
+def _in_scope_enums(module_name: str, index: CodebaseIndex) -> dict[str, ClassInfo]:
+    """Return mapping of visible local name -> StrEnum/IntEnum ClassInfo for `module_name`."""
+    in_scope: dict[str, ClassInfo] = {
+        cls.name: cls
+        for cls in index.classes.values()
+        if cls.module_name == module_name and cls.enum_kind is not None
+    }
+    for local_name, target_qual in index.module_imports.get(module_name, {}).items():
+        target_cls = index.classes.get(target_qual)
+        if target_cls is not None and target_cls.enum_kind is not None:
+            in_scope[local_name] = target_cls
+    return in_scope
+
+
 def _rule_nt202_unused_optional_param(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
     """NT202: Parameter typed `T | None` never receives `None` across callers."""
     if param.optional_inner is None or param.annotation_str is None:
@@ -1184,9 +1342,9 @@ def _rule_nt202_unused_optional_param(
     score, notes = score_tier2_unused_optional_param(
         OptionalParamScoreContext(
             is_private=func.is_private,
-            closed_world=config.closed_world,
+            closed_world=ctx.config.closed_world,
             call_count=call_count,
-            min_call_sites=config.min_call_sites,
+            min_call_sites=ctx.config.min_call_sites,
             only_test_callers=only_test,
             has_none_default=param.default_is_none,
         )
@@ -1376,7 +1534,7 @@ def _rule_nt204_unused_union_param(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
     """NT204: Parameter union `A | B | C` has unused non-None branch(es) across callers."""
     members = param.union_members
@@ -1411,9 +1569,9 @@ def _rule_nt204_unused_union_param(
     score, notes = score_tier2_unused_optional_param(
         OptionalParamScoreContext(
             is_private=func.is_private,
-            closed_world=config.closed_world,
+            closed_world=ctx.config.closed_world,
             call_count=call_count,
-            min_call_sites=config.min_call_sites,
+            min_call_sites=ctx.config.min_call_sites,
             only_test_callers=only_test,
             has_none_default=drops_none,
         )
@@ -1453,7 +1611,7 @@ def _rule_nt205_constant_bool_param(
     func: FunctionInfo,
     param: ParamInfo,
     stats: ParamCallStats,
-    config: NarrowerConfig,
+    ctx: _RuleEvalContext,
 ) -> NarrowingCandidate | None:
     """NT205: Boolean parameter always receives a single constant (True or False)."""
     if not param.is_bool or param.annotation_str is None:
@@ -1474,9 +1632,9 @@ def _rule_nt205_constant_bool_param(
     score, notes = score_tier2_constant_bool_param(
         ConstantBoolScoreContext(
             is_private=func.is_private,
-            closed_world=config.closed_world,
+            closed_world=ctx.config.closed_world,
             call_count=total_calls,
-            min_call_sites=config.min_call_sites,
+            min_call_sites=ctx.config.min_call_sites,
             only_test_callers=only_test,
             has_default=param.has_default,
         )

@@ -535,3 +535,66 @@ def caller() -> None:
     assert "def _record_metric(payload: MetricEvent) -> None:" in rewritten
     assert 'def _track_scores(scores: dict[Literal["a", "b"], int]) -> None:' in rewritten
     assert "def _log_extra(meta: dict[str, Any]) -> None:" in rewritten
+
+
+def test_strenum_and_intenum_narrowing_across_nt101_nt103_nt201(tmp_path: Path) -> None:
+    code = """from enum import IntEnum, StrEnum
+
+class Status(StrEnum):
+    OK = "ok"
+    ERR = "err"
+
+class Level(IntEnum):
+    LOW = 1
+    HIGH = 2
+
+def parse_status(raw: str) -> Status:
+    return Status(raw)
+
+def safe_parse_status(raw: str) -> Status | None:
+    try:
+        return Status(raw)
+    except ValueError:
+        return None
+
+def pick_status(flag: bool) -> str:
+    if flag:
+        return Status.OK
+    return Status.ERR
+
+def pick_level(flag: bool) -> int:
+    return Level.HIGH if flag else Level.LOW
+
+def _record(status: str) -> int:
+    return len(status)
+
+def caller() -> None:
+    _record(Status.OK)
+    _record(Status.ERR)
+"""
+    mod = tmp_path / "enums.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    by_fn_code = {(c.symbol.rsplit(".", maxsplit=1)[-1], c.code): c for c in cands}
+
+    assert ("parse_status", RuleCode.NT101) in by_fn_code
+    assert by_fn_code[("parse_status", RuleCode.NT101)].suggested_type == 'Literal["err", "ok"]'
+    assert ("safe_parse_status", RuleCode.NT101) not in by_fn_code
+
+    assert ("pick_status", RuleCode.NT103) in by_fn_code
+    assert by_fn_code[("pick_status", RuleCode.NT103)].suggested_type == "Status"
+    assert by_fn_code[("pick_status", RuleCode.NT103)].needs_literal_import is False
+
+    assert ("pick_level", RuleCode.NT103) in by_fn_code
+    assert by_fn_code[("pick_level", RuleCode.NT103)].suggested_type == "Level"
+
+    assert ("_record", RuleCode.NT201) in by_fn_code
+    assert by_fn_code[("_record", RuleCode.NT201)].suggested_type == "Status"
+    assert by_fn_code[("_record", RuleCode.NT201)].needs_literal_import is False
+
+    rewritten = rewrite_module_source(code, cands)
+    assert 'def parse_status(raw: Literal["err", "ok"]) -> Status:' in rewritten
+    assert "def pick_status(flag: bool) -> Status:" in rewritten
+    assert "def pick_level(flag: bool) -> Level:" in rewritten
+    assert "def _record(status: Status) -> int:" in rewritten

@@ -47,6 +47,8 @@ class ReturnSummary:
     dict_key_presence: dict[str, int] = field(default_factory=dict)
     dict_key_types: dict[str, set[str]] = field(default_factory=dict)
     dict_key_unknown: set[str] = field(default_factory=set)
+    all_returns_enum_attr: bool = True
+    returned_enum_attrs: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass
@@ -56,6 +58,7 @@ class ParamGuardInfo:
     strict_literals: set[ExtractedLiteral] = field(default_factory=set)
     strict_evidence: list[str] = field(default_factory=list)
     soft_literals: set[ExtractedLiteral] = field(default_factory=set)
+    coerced_enum_names: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -178,8 +181,43 @@ def _analyze_param_guards(
     strict_param_names = param_names - reassigned
     _scan_statements_for_guards(stmts, strict_param_names, guards)
     _scan_const_dict_subscripts(stmts, strict_param_names, module_const_dicts, guards)
+    _scan_enum_coercion_calls(stmts, strict_param_names, guards)
     _scan_soft_comparisons(stmts, param_names, guards)
     return guards
+
+
+def _scan_enum_coercion_calls(
+    stmts: list[cst.BaseStatement],
+    param_names: set[str],
+    guards: dict[str, ParamGuardInfo],
+) -> None:
+    """Record top-level unconditional `Callee(param)` calls (outside try/except blocks)."""
+    for stmt in stmts:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            expr = _extract_unconditional_call_expr(small)
+            if expr is None:
+                continue
+            if (
+                isinstance(expr.func, cst.Name)
+                and len(expr.args) == 1
+                and expr.args[0].keyword is None
+                and expr.args[0].star == ""
+                and isinstance(expr.args[0].value, cst.Name)
+                and expr.args[0].value.value in param_names
+            ):
+                guards[expr.args[0].value.value].coerced_enum_names.add(expr.func.value)
+
+
+def _extract_unconditional_call_expr(stmt: cst.BaseSmallStatement) -> cst.Call | None:
+    """Return a Call expression from a direct statement, assignment, or return."""
+    if isinstance(stmt, cst.Expr) and isinstance(stmt.value, cst.Call):
+        return stmt.value
+    if isinstance(stmt, cst.Return) and isinstance(stmt.value, cst.Call):
+        return stmt.value
+    _name, val = _extract_simple_assignment(stmt)
+    return val if isinstance(val, cst.Call) else None
 
 
 def _scan_statements_for_guards(
@@ -405,6 +443,8 @@ class _ReturnCollector(cst.CSTVisitor):
         self.dict_key_presence: dict[str, int] = {}
         self.dict_key_types: dict[str, set[str]] = {}
         self.dict_key_unknown: set[str] = set()
+        self.all_returns_enum_attr = True
+        self.returned_enum_attrs: set[tuple[str, str]] = set()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
         return False
@@ -432,6 +472,7 @@ class _ReturnCollector(cst.CSTVisitor):
             self.all_returns_non_none_seq = False
             self.all_returns_non_none_dict = False
             self.all_returns_const_str_dict = False
+            self.all_returns_enum_attr = False
             self.returned_types.add("None")
             return False
 
@@ -448,6 +489,7 @@ class _ReturnCollector(cst.CSTVisitor):
         self._record_non_none_seq(node.value)
         self._record_non_none_dict(node.value)
         self._record_const_str_dict(node.value)
+        self._record_enum_attr_return(node.value)
 
         lit = extract_literal(node.value)
         if lit is not None:
@@ -541,6 +583,19 @@ class _ReturnCollector(cst.CSTVisitor):
         for key in seen_in_return:
             self.dict_key_presence[key] = self.dict_key_presence.get(key, 0) + 1
 
+    def _record_enum_attr_return(self, expr: cst.BaseExpression) -> None:
+        """Track whether every return expression is a `ClassName.MEMBER` attribute access."""
+        if not self.all_returns_enum_attr:
+            return
+        if isinstance(expr, cst.IfExp):
+            self._record_enum_attr_return(expr.body)
+            self._record_enum_attr_return(expr.orelse)
+            return
+        if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
+            self.returned_enum_attrs.add((expr.value.value, expr.attr.value))
+            return
+        self.all_returns_enum_attr = False
+
     def _record_fixed_tuple(self, expr: cst.BaseExpression) -> None:
         """Track fixed-length tuple literal returns and per-slot inferred types."""
         if not self.all_returns_fixed_tuple:
@@ -619,6 +674,8 @@ def _analyze_returns(
     summary.dict_key_presence = collector.dict_key_presence
     summary.dict_key_types = collector.dict_key_types
     summary.dict_key_unknown = collector.dict_key_unknown
+    summary.all_returns_enum_attr = collector.all_returns_enum_attr
+    summary.returned_enum_attrs = collector.returned_enum_attrs
     summary.can_fallthrough = not _block_always_terminates(stmts)
     return summary
 

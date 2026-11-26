@@ -42,10 +42,16 @@ NAMEDTUPLE_BASE_NAMES: frozenset[str] = frozenset({"NamedTuple", "typing.NamedTu
 TYPEDDICT_BASE_NAMES: frozenset[str] = frozenset(
     {"TypedDict", "typing.TypedDict", "typing_extensions.TypedDict"}
 )
+STRENUM_BASE_NAMES: frozenset[str] = frozenset({"StrEnum", "enum.StrEnum"})
+INTENUM_BASE_NAMES: frozenset[str] = frozenset({"IntEnum", "enum.IntEnum"})
+ENUM_BASE_NAMES: frozenset[str] = frozenset({"Enum", "enum.Enum"})
 TRIVIAL_BASE_NAMES: frozenset[str] = (
     ABSTRACT_BASE_NAMES
     | NAMEDTUPLE_BASE_NAMES
     | TYPEDDICT_BASE_NAMES
+    | STRENUM_BASE_NAMES
+    | INTENUM_BASE_NAMES
+    | ENUM_BASE_NAMES
     | frozenset({"object", "builtins.object", "Generic", "typing.Generic"})
 )
 
@@ -135,6 +141,7 @@ class ObservedArg:
     is_unknown: bool = False
     observed_type: str | None = None
     dict_literal_keys: tuple[tuple[str, str | None], ...] | None = None
+    enum_qualname: str | None = None
 
 
 @dataclass
@@ -166,6 +173,9 @@ class ClassInfo:
     is_typeddict: bool = False
     typeddict_total: bool = True
     is_kw_only_dataclass: bool = False
+    enum_kind: TypingLiteral["str", "int"] | None = None
+    enum_members: frozenset[str] = field(default_factory=frozenset)
+    enum_values: frozenset[ExtractedLiteral] = field(default_factory=frozenset)
     fields: list[FieldInfo] = field(default_factory=list)
     attr_facts: list[ClassAttrFact] = field(default_factory=list)
 
@@ -435,6 +445,12 @@ class _DefinitionCollector(cst.CSTVisitor):
         is_namedtuple = any(base in NAMEDTUPLE_BASE_NAMES for base in bases)
         is_typeddict = any(base in TYPEDDICT_BASE_NAMES for base in bases)
         typeddict_total = _extract_typeddict_total(node) if is_typeddict else True
+        enum_kind = _detect_enum_kind(bases)
+        enum_members, enum_values = (
+            _extract_enum_members(node, enum_kind)
+            if enum_kind is not None
+            else (frozenset(), frozenset())
+        )
         prefix = ".".join(c.name for c in self._class_stack)
         cls_name = f"{prefix}.{node.name.value}" if prefix else node.name.value
         qualname = f"{self.module_name}.{cls_name}"
@@ -456,7 +472,7 @@ class _DefinitionCollector(cst.CSTVisitor):
         )
         attr_facts = (
             analyze_class_attributes(node, self.known_class_names, self._node_position)
-            if not (is_proto_abc or is_dataclass or is_namedtuple or is_typeddict)
+            if not (is_proto_abc or is_dataclass or is_namedtuple or is_typeddict or enum_kind)
             else []
         )
         cls_info = ClassInfo(
@@ -475,6 +491,9 @@ class _DefinitionCollector(cst.CSTVisitor):
             is_typeddict=is_typeddict,
             typeddict_total=typeddict_total,
             is_kw_only_dataclass=is_kw_only_dc,
+            enum_kind=enum_kind,
+            enum_members=enum_members,
+            enum_values=enum_values,
             fields=fields,
             attr_facts=attr_facts,
         )
@@ -904,6 +923,49 @@ class _LocalVarBinding:
     is_non_none: bool = False
     class_type: str | None = None
     inferred_type: str | None = None
+
+
+def _detect_enum_kind(bases: list[str]) -> TypingLiteral["str", "int"] | None:
+    """Return 'str' or 'int' if class bases define a StrEnum or IntEnum."""
+    if any(b in STRENUM_BASE_NAMES for b in bases):
+        return "str"
+    if any(b in INTENUM_BASE_NAMES for b in bases):
+        return "int"
+    if any(b in ENUM_BASE_NAMES for b in bases):
+        if "str" in bases or "builtins.str" in bases:
+            return "str"
+        if "int" in bases or "builtins.int" in bases:
+            return "int"
+    return None
+
+
+def _extract_enum_members(
+    node: cst.ClassDef,
+    enum_kind: TypingLiteral["str", "int"],
+) -> tuple[frozenset[str], frozenset[ExtractedLiteral]]:
+    """Extract member names and constant literal values from a StrEnum/IntEnum body."""
+    if not isinstance(node.body, cst.IndentedBlock):
+        return (frozenset(), frozenset())
+    members: set[str] = set()
+    values: set[ExtractedLiteral] = set()
+    has_non_literal_member = False
+    for stmt in node.body.body:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            if not isinstance(small, cst.Assign) or len(small.targets) != 1:
+                continue
+            target = small.targets[0].target
+            if not isinstance(target, cst.Name) or target.value.startswith("_"):
+                continue
+            members.add(target.value)
+            lit = extract_literal(small.value)
+            if lit is not None and lit.kind == enum_kind:
+                values.add(lit)
+            else:
+                has_non_literal_member = True
+    final_values = frozenset() if has_non_literal_member else frozenset(values)
+    return (frozenset(members), final_values)
 
 
 def _extract_typeddict_total(node: cst.ClassDef) -> bool:
@@ -1406,6 +1468,19 @@ class _CallSiteCollector(cst.CSTVisitor):
         if isinstance(expr, cst.Name):
             return self._classify_name_arg(expr.value, line)
 
+        if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
+            enum_cls = self._resolve_in_scope_enum(expr.value.value)
+            if enum_cls is not None and expr.attr.value in enum_cls.enum_members:
+                return ObservedArg(
+                    file=self.ctx.file,
+                    line=line,
+                    is_test_caller=self.ctx.is_test_file,
+                    is_non_none=True,
+                    is_unknown=True,
+                    observed_type=enum_cls.name,
+                    enum_qualname=enum_cls.qualname,
+                )
+
         dict_keys = self._extract_const_str_dict_arg(expr) if isinstance(expr, cst.Dict) else None
 
         inferred = infer_simple_expr_type(expr)
@@ -1451,6 +1526,11 @@ class _CallSiteCollector(cst.CSTVisitor):
                     observed_type=obs_type,
                 )
             if binding.is_non_none:
+                enum_cls = (
+                    self._resolve_in_scope_enum(binding.inferred_type)
+                    if binding.inferred_type is not None
+                    else None
+                )
                 return ObservedArg(
                     file=self.ctx.file,
                     line=line,
@@ -1458,6 +1538,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                     is_non_none=True,
                     is_unknown=True,
                     observed_type=binding.inferred_type,
+                    enum_qualname=enum_cls.qualname if enum_cls is not None else None,
                 )
             if binding.inferred_type is not None:
                 return ObservedArg(
@@ -1505,6 +1586,18 @@ class _CallSiteCollector(cst.CSTVisitor):
             and isinstance(expr.func, cst.Name)
         ):
             return expr.func.value
+        return None
+
+    def _resolve_in_scope_enum(self, cls_name: str) -> ClassInfo | None:
+        """Resolve a class name in the caller's module to an indexed StrEnum/IntEnum ClassInfo."""
+        same_mod = self.index.classes.get(f"{self.ctx.module_name}.{cls_name}")
+        if same_mod is not None and same_mod.enum_kind is not None:
+            return same_mod
+        imported_qual = self.ctx.imports.get(cls_name)
+        if imported_qual is not None:
+            imported_cls = self.index.classes.get(imported_qual)
+            if imported_cls is not None and imported_cls.enum_kind is not None:
+                return imported_cls
         return None
 
     def _is_known_class_ctor_call(self, expr: cst.BaseExpression) -> bool:
