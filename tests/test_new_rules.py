@@ -398,3 +398,41 @@ def empty_only() -> list[int | None]:
     assert "def gen_with_send() -> Generator[str, None, None]:" in rewritten
     assert "def filtered_list(xs: list[str | None]) -> list[str]:" in rewritten
     assert "def dict_non_none(flag: bool) -> dict[str, int]:" in rewritten
+
+
+def test_nt108_concrete_any_and_object_returns(tmp_path: Path) -> None:
+    code = """from typing import Any
+
+class Widget:
+    pass
+
+def make_widget(flag: bool) -> Any:
+    if flag:
+        return Widget()
+    return None
+
+def compute_label(name: str) -> object:
+    return f"label:{name}"
+
+def returns_unknown(fn: Any) -> Any:
+    return fn()
+
+def returns_bare_list() -> Any:
+    return [1, 2, 3]
+
+def returns_only_none() -> Any:
+    return None
+"""
+    mod = tmp_path / "any_ret.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt108 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT108}
+
+    assert set(nt108.keys()) == {"make_widget", "compute_label"}
+    assert nt108["make_widget"].suggested_type == "Widget | None"
+    assert nt108["compute_label"].suggested_type == "str"
+
+    rewritten = rewrite_module_source(code, list(nt108.values()))
+    assert "def make_widget(flag: bool) -> Widget | None:" in rewritten
+    assert "def compute_label(name: str) -> str:" in rewritten

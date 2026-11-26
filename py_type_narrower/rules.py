@@ -30,6 +30,7 @@ from py_type_narrower.scorer import (
     ConstantBoolScoreContext,
     OptionalParamScoreContext,
     score_tier1_always_initialized_attr,
+    score_tier1_concrete_any_return,
     score_tier1_container_non_none,
     score_tier1_fixed_tuple_return,
     score_tier1_guarded_param,
@@ -175,6 +176,7 @@ def _run_tier1_function_rules(
         (RuleCode.NT103, _rule_nt103_literal_return),
         (RuleCode.NT106, _rule_nt106_fixed_tuple_return),
         (RuleCode.NT107, _rule_nt107_container_non_none_return),
+        (RuleCode.NT108, _rule_nt108_concrete_any_return),
     )
     seen_targets: set[tuple[TargetKind, str | None]] = set()
     for code, rule_fn in rules:
@@ -670,6 +672,71 @@ def _match_container_non_none_detail(kind: str, ret: ReturnSummary) -> str | Non
     if kind == "dict" and ret.all_returns_non_none_dict and ret.has_non_empty_dict_entry:
         return "every returned dictionary value is provably non-None"
     return None
+
+
+_BARE_GENERIC_CONTAINERS: frozenset[str] = frozenset({"list", "dict", "set", "frozenset", "tuple"})
+_MAX_ANY_RETURN_UNION_MEMBERS = 3
+
+
+def _rule_nt108_concrete_any_return(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+) -> list[NarrowingCandidate]:
+    """NT108: Return type `Any` / `object` only returns concrete inferable type(s)."""
+    if (
+        func.return_annotation_str is None
+        or func.return_annotation_str.strip() not in _ANY_OR_OBJECT_TYPES
+        or _skip_return_narrowing_for_protocol(func, config)
+    ):
+        return []
+    ret = func.body_facts.returns
+    if ret.is_stub or ret.is_generator or not ret.has_returns or ret.has_unknown_return_type:
+        return []
+
+    observed = set(ret.returned_types)
+    if ret.can_fallthrough:
+        observed.add("None")
+    if (
+        not observed
+        or observed == {"None"}
+        or len(observed) > _MAX_ANY_RETURN_UNION_MEMBERS
+        or any(t in _BARE_GENERIC_CONTAINERS or t in _ANY_OR_OBJECT_TYPES for t in observed)
+    ):
+        return []
+
+    ordered = sorted(t for t in observed if t != "None")
+    if "None" in observed:
+        ordered.append("None")
+    suggested = format_union_type(ordered)
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT108,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=suggested,
+            needs_literal_import=False,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but all return paths produce `{suggested}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="concrete_return_types",
+                    detail=f"Observed concrete return types: {', '.join(ordered)}",
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_concrete_any_return(is_private=func.is_private),
+            is_public=not func.is_private,
+        )
+    ]
 
 
 def _rule_nt201_callsite_literal(
