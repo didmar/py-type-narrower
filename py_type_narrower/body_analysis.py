@@ -779,14 +779,14 @@ def _infer_expr_types_in_scope(
         left = _infer_expr_types_in_scope(expr.body, local_types, known_class_names)
         right = _infer_expr_types_in_scope(expr.orelse, local_types, known_class_names)
         return (left | right) if (left is not None and right is not None) else None
+    if isinstance(expr, (cst.List, cst.Set)):
+        return {_infer_homogeneous_seq_type(expr, local_types, known_class_names)}
     simple = infer_simple_expr_type(expr)
     if simple is not None:
         return {simple}
-    if isinstance(expr, cst.Name) and expr.value in local_types:
-        typ = local_types[expr.value]
-        if typ in {"Any", "typing.Any", "object", "builtins.object"}:
-            return None
-        return {typ}
+    scoped = _lookup_scoped_expr_type(expr, local_types)
+    if scoped is not None:
+        return {scoped}
     if (
         isinstance(expr, cst.Call)
         and isinstance(expr.func, cst.Name)
@@ -794,6 +794,50 @@ def _infer_expr_types_in_scope(
     ):
         return {expr.func.value}
     return None
+
+
+def _lookup_scoped_expr_type(expr: cst.BaseExpression, local_types: dict[str, str]) -> str | None:
+    """Look up a non-broad type for a local variable `x` or attribute `self.<attr>`."""
+    key: str | None = None
+    if isinstance(expr, cst.Name):
+        key = expr.value
+    elif (
+        isinstance(expr, cst.Attribute)
+        and isinstance(expr.value, cst.Name)
+        and expr.value.value == "self"
+    ):
+        key = f"self.{expr.attr.value}"
+    if key is None:
+        return None
+    typ = local_types.get(key)
+    if typ is None or typ in {"Any", "typing.Any", "object", "builtins.object"}:
+        return None
+    return typ
+
+
+def _infer_homogeneous_seq_type(
+    expr: cst.List | cst.Set,
+    local_types: dict[str, str],
+    known_class_names: set[str],
+) -> str:
+    """Infer `list[T]` / `set[T]` for non-empty homogeneous literals, else bare `list` / `set`."""
+    container = "list" if isinstance(expr, cst.List) else "set"
+    if not expr.elements:
+        return container
+    elem_types: set[str] = set()
+    for elem in expr.elements:
+        if isinstance(elem, cst.StarredElement):
+            return container
+        inferred = _infer_expr_types_in_scope(elem.value, local_types, known_class_names)
+        if inferred is None or len(inferred) != 1:
+            return container
+        only = next(iter(inferred))
+        if only in {"list", "dict", "set", "frozenset", "tuple"}:
+            return container
+        elem_types.add(only)
+    if len(elem_types) == 1:
+        return f"{container}[{next(iter(elem_types))}]"
+    return container
 
 
 def _is_stub_body(stmts: list[cst.BaseStatement]) -> bool:

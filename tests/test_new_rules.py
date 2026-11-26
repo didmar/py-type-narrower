@@ -417,8 +417,11 @@ def compute_label(name: str) -> object:
 def returns_unknown(fn: Any) -> Any:
     return fn()
 
-def returns_bare_list() -> Any:
+def returns_typed_list() -> Any:
     return [1, 2, 3]
+
+def returns_empty_list() -> Any:
+    return []
 
 def returns_only_none() -> Any:
     return None
@@ -429,13 +432,15 @@ def returns_only_none() -> Any:
     cands = run_rules(index, NarrowerConfig(max_tier=1))
     nt108 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT108}
 
-    assert set(nt108.keys()) == {"make_widget", "compute_label"}
+    assert set(nt108.keys()) == {"make_widget", "compute_label", "returns_typed_list"}
     assert nt108["make_widget"].suggested_type == "Widget | None"
     assert nt108["compute_label"].suggested_type == "str"
+    assert nt108["returns_typed_list"].suggested_type == "list[int]"
 
     rewritten = rewrite_module_source(code, list(nt108.values()))
     assert "def make_widget(flag: bool) -> Widget | None:" in rewritten
     assert "def compute_label(name: str) -> str:" in rewritten
+    assert "def returns_typed_list() -> list[int]:" in rewritten
 
 
 def test_nt109_structured_dict_returns_typeddict_and_literal_keys(tmp_path: Path) -> None:
@@ -694,3 +699,38 @@ def produce() -> None:
     assert '    action: Literal["create", "update"]\n' in rewritten
     assert "    version: int\n" in rewritten
     assert "    extra: NotRequired[str]\n" in rewritten
+
+
+def test_nt109_infers_parameterized_list_and_self_attr_types(tmp_path: Path) -> None:
+    code = """from typing import Any
+
+class Completer:
+    prog_name: str
+
+    def __init__(self, prog_name: str, retries: int) -> None:
+        self.prog_name = prog_name
+        self.retries = retries
+
+    @property
+    def tag(self) -> str:
+        return "v1"
+
+    def source_vars(self) -> dict[str, Any]:
+        return {
+            "prog_name": self.prog_name,
+            "retries": self.retries,
+            "tag": self.tag,
+            "formatter": ["black", "-"],
+            "ports": {80, 443},
+        }
+"""
+    mod = tmp_path / "comp.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt109 = [c for c in cands if c.code == RuleCode.NT109]
+    assert len(nt109) == 1
+    assert (
+        nt109[0].suggested_type
+        == "TypedDict({'formatter': list[str], 'ports': set[int], 'prog_name': str, 'retries': int, 'tag': str})"
+    )

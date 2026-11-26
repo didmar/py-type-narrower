@@ -451,6 +451,7 @@ class _DefinitionCollector(cst.CSTVisitor):
         self.known_class_names = cfg.known_class_names
         self.index = index
         self._class_stack: list[ClassInfo] = []
+        self._class_attr_types_stack: list[dict[str, str]] = []
         self._func_depth = 0
 
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: N802
@@ -527,6 +528,7 @@ class _DefinitionCollector(cst.CSTVisitor):
         )
         self.index.classes[qualname] = cls_info
         self._class_stack.append(cls_info)
+        self._class_attr_types_stack.append(_collect_class_self_attr_types(node))
         return True
 
     def _node_position(self, node: cst.CSTNode) -> tuple[int, int]:
@@ -624,6 +626,7 @@ class _DefinitionCollector(cst.CSTVisitor):
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: N802
         if not _has_decorator(original_node, {"no_type_check"}):
             self._class_stack.pop()
+            self._class_attr_types_stack.pop()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: N802
         in_nested = self._func_depth > 0
@@ -653,6 +656,9 @@ class _DefinitionCollector(cst.CSTVisitor):
             and p.annotation_str != "None"
         }
         param_types = {p.name: p.annotation_str for p in params if p.annotation_str is not None}
+        if self._class_attr_types_stack:
+            for attr_name, attr_type in self._class_attr_types_stack[-1].items():
+                param_types[f"self.{attr_name}"] = attr_type
         body_facts = analyze_function_body(
             node,
             param_non_none_names=param_non_none,
@@ -910,18 +916,6 @@ def _resolve_relative_module(node: cst.ImportFrom, current_module: str) -> str:
 def _collect_top_level_class_names(module: cst.Module) -> set[str]:
     """Return names of classes defined at top level in a module."""
     return {stmt.name.value for stmt in module.body if isinstance(stmt, cst.ClassDef)}
-
-
-def _has_decorator(node: cst.FunctionDef | cst.ClassDef, names: set[str]) -> bool:
-    """Return True if a function or class has any decorator matching one of `names`."""
-    for dec in node.decorators:
-        expr = dec.decorator
-        if isinstance(expr, cst.Call):
-            expr = expr.func
-        code = expr_to_code(expr)
-        if code in names or code.split(".")[-1] in names:
-            return True
-    return False
 
 
 def _is_symbol_private(
@@ -1755,6 +1749,27 @@ class _CallSiteCollector(cst.CSTVisitor):
 
     def _infer_call_expr_type(self, expr: cst.BaseExpression) -> str | None:
         """Infer a conservative static type string for an argument or dict-value expression."""
+        if isinstance(expr, (cst.List, cst.Set)) and expr.elements:
+            container = "list" if isinstance(expr, cst.List) else "set"
+            elem_types: set[str] = set()
+            homogeneous = True
+            for elem in expr.elements:
+                if isinstance(elem, cst.StarredElement):
+                    homogeneous = False
+                    break
+                inferred_el = self._infer_call_expr_type(elem.value)
+                if inferred_el is None or inferred_el in {
+                    "list",
+                    "dict",
+                    "set",
+                    "frozenset",
+                    "tuple",
+                }:
+                    homogeneous = False
+                    break
+                elem_types.add(inferred_el)
+            if homogeneous and len(elem_types) == 1:
+                return f"{container}[{next(iter(elem_types))}]"
         simple = infer_simple_expr_type(expr)
         if simple is not None:
             return simple
@@ -1803,6 +1818,73 @@ class _CallSiteCollector(cst.CSTVisitor):
             self.ctx.imports.get(expr.func.value, ""),
         }
         return any(c in self.index.classes for c in cls_candidates)
+
+
+def _collect_class_self_attr_types(cls_node: cst.ClassDef) -> dict[str, str]:
+    """Collect declared `self.<attr>` types from class body, `__init__`, and `@property` methods."""
+    if not isinstance(cls_node.body, cst.IndentedBlock):
+        return {}
+    attr_types: dict[str, str] = {}
+    for stmt in cls_node.body.body:
+        if isinstance(stmt, cst.SimpleStatementLine):
+            for small in stmt.body:
+                if isinstance(small, cst.AnnAssign) and isinstance(small.target, cst.Name):
+                    ann_str = expr_to_code(small.annotation.annotation)
+                    if not ann_str.startswith(("ClassVar", "typing.ClassVar")):
+                        attr_types[small.target.value] = ann_str
+        elif isinstance(stmt, cst.FunctionDef):
+            if stmt.name.value == "__init__":
+                _collect_init_self_attr_types(stmt, attr_types)
+            elif stmt.returns is not None and _has_decorator(stmt, {"property"}):
+                attr_types[stmt.name.value] = expr_to_code(stmt.returns.annotation)
+    return attr_types
+
+
+def _has_decorator(node: cst.FunctionDef | cst.ClassDef, names: set[str]) -> bool:
+    """Return True if a function or class has any decorator matching one of `names`."""
+    for dec in node.decorators:
+        expr = dec.decorator
+        if isinstance(expr, cst.Call):
+            expr = expr.func
+        code = expr_to_code(expr)
+        if code in names or code.split(".")[-1] in names:
+            return True
+    return False
+
+
+def _collect_init_self_attr_types(init_fn: cst.FunctionDef, out: dict[str, str]) -> None:
+    """Collect `self.x: T = ...` and `self.x = typed_param` types inside `__init__`."""
+    if not isinstance(init_fn.body, cst.IndentedBlock):
+        return
+    param_types: dict[str, str] = {}
+    for p in (
+        *init_fn.params.posonly_params,
+        *init_fn.params.params,
+        *init_fn.params.kwonly_params,
+    ):
+        if p.annotation is not None:
+            param_types[p.name.value] = expr_to_code(p.annotation.annotation)
+    for stmt in init_fn.body.body:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            if (
+                isinstance(small, cst.AnnAssign)
+                and isinstance(small.target, cst.Attribute)
+                and isinstance(small.target.value, cst.Name)
+                and small.target.value.value == "self"
+            ):
+                out[small.target.attr.value] = expr_to_code(small.annotation.annotation)
+            elif (
+                isinstance(small, cst.Assign)
+                and len(small.targets) == 1
+                and isinstance(small.targets[0].target, cst.Attribute)
+                and isinstance(small.targets[0].target.value, cst.Name)
+                and small.targets[0].target.value.value == "self"
+                and isinstance(small.value, cst.Name)
+                and small.value.value in param_types
+            ):
+                out.setdefault(small.targets[0].target.attr.value, param_types[small.value.value])
 
 
 def _extract_class_ref(annotation: cst.Annotation | None) -> str | None:
