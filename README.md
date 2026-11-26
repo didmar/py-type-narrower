@@ -93,6 +93,10 @@ py-type-narrower fix . --verify --verifier ty
 
 # Apply Tier 1 + Tier 2 fixes with multi-pass fixpoint propagation
 py-type-narrower fix . --closed-world --unsafe-fixes --max-passes 3 --verify
+
+# Check only git-changed files (or branch diff vs main) while still indexing the full project
+py-type-narrower check --changed --closed-world
+py-type-narrower check --diff-base main --closed-world --verify
 ```
 
 ### Configurable Soundness Verifier

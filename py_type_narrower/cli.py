@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from py_type_narrower import __version__
 from py_type_narrower.config import NarrowerConfig, load_config
 from py_type_narrower.engine import RunOptions, analyze_paths
-from py_type_narrower.models import RuleCode
+from py_type_narrower.models import AnalysisResult, RuleCode
 from py_type_narrower.reporting import format_diffs, format_report
 
 
@@ -18,7 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    paths = [Path(p) for p in args.paths] or [Path()]
+    explicit_paths = [Path(p) for p in args.paths]
+    paths = explicit_paths or [Path()]
     project_root = _infer_project_root(paths)
     config = load_config(project_root)
     _apply_cli_overrides(config, args)
@@ -27,17 +30,28 @@ def main(argv: list[str] | None = None) -> int:
     apply_fixes = command == "fix"
     show_diff = command == "diff" or getattr(args, "diff", False)
     unsafe_fixes = getattr(args, "unsafe_fixes", False)
+    use_changed = bool(args.changed or args.diff_base is not None)
 
     try:
-        result = analyze_paths(
-            paths=paths,
-            project_root=project_root,
-            config=config,
-            options=RunOptions(
-                apply_fixes=apply_fixes,
-                unsafe_fixes=unsafe_fixes,
-                compute_diffs=show_diff,
-            ),
+        if use_changed:
+            paths = _discover_git_changed_files(
+                project_root,
+                diff_base=args.diff_base,
+                scope_paths=explicit_paths or None,
+            )
+        result = (
+            AnalysisResult()
+            if not paths
+            else analyze_paths(
+                paths=paths,
+                project_root=project_root,
+                config=config,
+                options=RunOptions(
+                    apply_fixes=apply_fixes,
+                    unsafe_fixes=unsafe_fixes,
+                    compute_diffs=show_diff,
+                ),
+            )
         )
     except (ValueError, RuntimeError) as exc:
         sys.stderr.write(f"error: {exc}\n")
@@ -144,6 +158,16 @@ def _add_common_options(subparser: argparse.ArgumentParser) -> None:
         help="Only index the explicitly passed paths instead of the full project root for Tier 2",
     )
     subparser.add_argument(
+        "--changed",
+        action="store_true",
+        help="Only report/fix git-modified or untracked Python files (full project still indexed for Tier 2)",
+    )
+    subparser.add_argument(
+        "--diff-base",
+        default=None,
+        help="Git ref to diff against (implies --changed, e.g. 'main' or 'origin/main')",
+    )
+    subparser.add_argument(
         "--max-literals",
         type=int,
         default=None,
@@ -227,6 +251,88 @@ def _apply_cli_overrides(config: NarrowerConfig, args: argparse.Namespace) -> No
         config.exclude.extend(args.exclude)
     if args.index_project_root is False:
         config.index_project_root = False
+
+
+def _discover_git_changed_files(
+    project_root: Path,
+    *,
+    diff_base: str | None,
+    scope_paths: list[Path] | None,
+) -> list[Path]:
+    """Return existing git-modified/untracked `.py` files under `project_root`."""
+    git_exe = shutil.which("git")
+    if git_exe is None:
+        msg = "`--changed` requires `git` on PATH"
+        raise RuntimeError(msg)
+
+    root_proc = _run_git(git_exe, ["rev-parse", "--show-toplevel"], project_root)
+    if root_proc.returncode != 0:
+        msg = f"`--changed` requires a git repository (not found at {project_root})"
+        raise RuntimeError(msg)
+    git_root = Path(root_proc.stdout.strip()).resolve()
+
+    rel_entries: set[str] = set()
+    rel_entries.update(_collect_git_diff_files(git_exe, git_root, diff_base))
+    untracked_proc = _run_git(git_exe, ["ls-files", "--others", "--exclude-standard"], git_root)
+    if untracked_proc.returncode == 0:
+        rel_entries.update(
+            line.strip() for line in untracked_proc.stdout.splitlines() if line.strip()
+        )
+
+    resolved_scopes = [p.resolve() for p in scope_paths] if scope_paths else None
+    changed: list[Path] = []
+    for rel in sorted(rel_entries):
+        full = (git_root / rel).resolve()
+        if not full.is_file() or full.suffix != ".py":
+            continue
+        if resolved_scopes is not None and not _is_within_any(full, resolved_scopes):
+            continue
+        changed.append(full)
+    return changed
+
+
+def _collect_git_diff_files(git_exe: str, git_root: Path, diff_base: str | None) -> list[str]:
+    """Return modified/added file paths from `git diff` against `diff_base` or `HEAD`."""
+    if diff_base is not None:
+        proc = _run_git(
+            git_exe, ["diff", "--name-only", "--diff-filter=ACMRTUXB", diff_base], git_root
+        )
+        if proc.returncode != 0:
+            msg = f"Failed to diff against git ref `{diff_base}`: {proc.stderr.strip()}"
+            raise RuntimeError(msg)
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    proc = _run_git(git_exe, ["diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD"], git_root)
+    if proc.returncode != 0:
+        proc = _run_git(
+            git_exe, ["diff", "--name-only", "--cached", "--diff-filter=ACMRTUXB"], git_root
+        )
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _run_git(git_exe: str, git_args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Execute a git command cleanly with captured UTF-8 output."""
+    return subprocess.run(  # noqa: S603
+        [git_exe, *git_args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _is_within_any(file_path: Path, scopes: list[Path]) -> bool:
+    """Return True if `file_path` equals or resides inside any path in `scopes`."""
+    for scope in scopes:
+        if file_path == scope:
+            return True
+        if scope.is_dir():
+            try:
+                file_path.relative_to(scope)
+            except ValueError:
+                continue
+            return True
+    return False
 
 
 def _parse_csv_codes(raw: str) -> set[RuleCode]:

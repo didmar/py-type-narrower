@@ -1,6 +1,10 @@
 import ast
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from py_type_narrower.cli import main
 from py_type_narrower.config import NarrowerConfig, load_config
@@ -257,3 +261,82 @@ def test_glob_excludes_and_no_project_index_cli(tmp_path: Path, capsys) -> None:
     rc = main(["check", str(keep), "--closed-world", "--no-project-index"])
     _ = capsys.readouterr()
     assert rc == 0
+
+
+def test_cli_changed_and_diff_base_flags(tmp_path: Path, capsys) -> None:
+    git_exe = shutil.which("git")
+    if git_exe is None:
+        pytest.skip("git is not installed")
+
+    def run_git(*git_args: str) -> None:
+        subprocess.run(  # noqa: S603
+            [git_exe, *git_args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run_git("init", "-b", "main")
+    run_git("config", "user.email", "test@example.com")
+    run_git("config", "user.name", "Test")
+
+    unchanged = tmp_path / "unchanged.py"
+    unchanged.write_text(
+        """def _old_issue(x: str) -> str | None:
+    return x
+""",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "caller.py"
+    caller.write_text(
+        """from changed import render
+
+def run() -> None:
+    render("fast")
+    render("safe")
+""",
+        encoding="utf-8",
+    )
+    changed = tmp_path / "changed.py"
+    changed.write_text(
+        """def render(mode: str) -> int:
+    return len(mode)
+""",
+        encoding="utf-8",
+    )
+    run_git("add", ".")
+    run_git("commit", "-m", "initial")
+
+    # Clean tree: --changed finds 0 files and exits 0.
+    rc_clean = main(["check", str(tmp_path), "--changed", "--closed-world"])
+    _ = capsys.readouterr()
+    assert rc_clean == 0
+
+    # Edit only `changed.py`: --changed reports `changed.py` (with callers from `caller.py`)
+    # while skipping pre-existing issues in `unchanged.py`!
+    changed.write_text(
+        """def render(mode: str) -> int:
+    # modified
+    return len(mode)
+""",
+        encoding="utf-8",
+    )
+    rc_changed = main(["check", str(tmp_path), "--changed", "--closed-world", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc_changed == 1
+    assert len(payload["candidates"]) == 1
+    assert payload["candidates"][0]["file"] == "changed.py"
+    assert payload["candidates"][0]["code"] == "NT201"
+    assert payload["candidates"][0]["suggested_type"] == 'Literal["fast", "safe"]'
+
+    # Commit the edit on a feature branch and test `--diff-base main`!
+    run_git("checkout", "-b", "feat")
+    run_git("add", "changed.py")
+    run_git("commit", "-m", "modify changed.py")
+    rc_base = main(
+        ["check", str(tmp_path), "--diff-base", "main", "--closed-world", "--format", "json"]
+    )
+    payload_base = json.loads(capsys.readouterr().out)
+    assert rc_base == 1
+    assert [c["file"] for c in payload_base["candidates"]] == ["changed.py"]
