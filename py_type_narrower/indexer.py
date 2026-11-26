@@ -170,7 +170,7 @@ class ClassInfo:
 
 
 @dataclass
-class RepoIndex:
+class CodebaseIndex:
     """Complete static index for a set of Python files."""
 
     files: dict[Path, str] = field(default_factory=dict)
@@ -200,8 +200,8 @@ def index_paths(
     exclude: list[str],
     *,
     overrides: dict[Path, str] | None = None,
-) -> RepoIndex:
-    """Discover and index Python files under paths into a RepoIndex."""
+) -> CodebaseIndex:
+    """Discover and index Python files under paths into a CodebaseIndex."""
     python_files = discover_python_files(paths, exclude)
     return index_files(python_files, project_root, overrides=overrides)
 
@@ -211,9 +211,9 @@ def index_files(
     project_root: Path,
     *,
     overrides: dict[Path, str] | None = None,
-) -> RepoIndex:
+) -> CodebaseIndex:
     """Index an explicit list of Python files (optionally with in-memory content overrides)."""
-    index = RepoIndex()
+    index = CodebaseIndex()
     module_contexts: list[_ModuleContext] = []
 
     # Pass 1: parse modules, collect classes, functions, imports, and local body facts.
@@ -280,7 +280,7 @@ _MAX_REEXPORT_HOPS = 8
 
 def _resolve_module_reexports(
     module_contexts: list[_ModuleContext],
-    index: RepoIndex,
+    index: CodebaseIndex,
 ) -> None:
     """Resolve package `__init__.py` and module re-exports transitively in `ctx.imports`."""
     reexports: dict[str, str] = {}
@@ -301,7 +301,7 @@ def _resolve_module_reexports(
             ctx.imports[local_name] = curr
 
 
-def _mark_method_overrides(index: RepoIndex) -> dict[str, list[ClassInfo]]:
+def _mark_method_overrides(index: CodebaseIndex) -> dict[str, list[ClassInfo]]:
     """Mark override relationships and base/external-subclass flags across indexed classes."""
     classes_by_short_name: dict[str, list[ClassInfo]] = {}
     for cls in index.classes.values():
@@ -410,7 +410,7 @@ class _DefinitionCollector(cst.CSTVisitor):
 
     METADATA_DEPENDENCIES = (PositionProvider,)
 
-    def __init__(self, cfg: _DefCollectionConfig, index: RepoIndex) -> None:
+    def __init__(self, cfg: _DefCollectionConfig, index: CodebaseIndex) -> None:
         self.file = cfg.file
         self.module_name = cfg.module_name
         self.is_test_file = cfg.is_test_file
@@ -666,7 +666,7 @@ def _index_module_definitions(
     path: Path,
     source: str,
     project_root: Path,
-    index: RepoIndex,
+    index: CodebaseIndex,
 ) -> _ModuleContext | None:
     """Parse one module and populate its classes, functions, and body facts in the index."""
     resolved = path.resolve()
@@ -936,7 +936,7 @@ class _CallSiteCollector(cst.CSTVisitor):
     def __init__(
         self,
         ctx: _ModuleContext,
-        index: RepoIndex,
+        index: CodebaseIndex,
         classes_by_short_name: dict[str, list[ClassInfo]],
     ) -> None:
         self.ctx = ctx
@@ -1489,7 +1489,7 @@ def _lookup_base_classes(
 
 def _collect_module_calls(
     ctx: _ModuleContext,
-    index: RepoIndex,
+    index: CodebaseIndex,
     classes_by_short_name: dict[str, list[ClassInfo]],
 ) -> None:
     """Visit a module to resolve call sites and aggregate per-parameter argument observations."""

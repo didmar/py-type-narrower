@@ -43,11 +43,11 @@ if TYPE_CHECKING:
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
         ClassInfo,
+        CodebaseIndex,
         FieldInfo,
         FunctionInfo,
         ParamCallStats,
         ParamInfo,
-        RepoIndex,
     )
 
     Tier1FunctionRule = Callable[[FunctionInfo, NarrowerConfig], list[NarrowingCandidate]]
@@ -95,8 +95,8 @@ DATA_MODEL_DUNDER_METHODS: frozenset[str] = frozenset(
 MODULE_DUNDER_FUNCTIONS: frozenset[str] = frozenset({"__getattr__", "__dir__"})
 
 
-def run_rules(index: RepoIndex, config: NarrowerConfig) -> list[NarrowingCandidate]:
-    """Evaluate all enabled narrowing rules against a RepoIndex."""
+def run_rules(index: CodebaseIndex, config: NarrowerConfig) -> list[NarrowingCandidate]:
+    """Evaluate all enabled narrowing rules against a CodebaseIndex."""
     active = config.active_rules()
     candidates: list[NarrowingCandidate] = []
 
@@ -115,7 +115,7 @@ def run_rules(index: RepoIndex, config: NarrowerConfig) -> list[NarrowingCandida
 
 def _evaluate_function_rules(
     func: FunctionInfo,
-    index: RepoIndex,
+    index: CodebaseIndex,
     config: NarrowerConfig,
     active: set[RuleCode],
     out: list[NarrowingCandidate],
@@ -129,7 +129,7 @@ def _evaluate_function_rules(
 
 def _evaluate_class_rules(
     cls: ClassInfo,
-    index: RepoIndex,
+    index: CodebaseIndex,
     config: NarrowerConfig,
     active: set[RuleCode],
     out: list[NarrowingCandidate],
@@ -167,7 +167,7 @@ def _run_tier1_function_rules(
 
 def _run_tier2_function_rules(
     func: FunctionInfo,
-    index: RepoIndex,
+    index: CodebaseIndex,
     config: NarrowerConfig,
     active: set[RuleCode],
     out: list[NarrowingCandidate],
@@ -618,7 +618,7 @@ def _rule_nt202_unused_optional_param(
 
 def _rule_nt203_structured_fields(
     cls: ClassInfo,
-    index: RepoIndex,
+    index: CodebaseIndex,
     config: NarrowerConfig,
 ) -> list[NarrowingCandidate]:
     """NT203: Dataclass / NamedTuple field narrowing across constructor & assignment sites."""
@@ -1027,7 +1027,7 @@ def _cannot_drop_field_none_default(cls: ClassInfo, fld: FieldInfo) -> bool:
     return False
 
 
-def _class_has_subclasses(cls: ClassInfo, index: RepoIndex) -> bool:
+def _class_has_subclasses(cls: ClassInfo, index: CodebaseIndex) -> bool:
     """Return True if any indexed class inherits from `cls`."""
     for other in index.classes.values():
         if other.qualname == cls.qualname:
@@ -1095,7 +1095,7 @@ def _build_callsite_literal_evidence(
 
 def _filter_ignored_and_scored(
     candidates: list[NarrowingCandidate],
-    index: RepoIndex,
+    index: CodebaseIndex,
     config: NarrowerConfig,
 ) -> list[NarrowingCandidate]:
     """Filter out suppressed findings and candidates below min_confidence."""
