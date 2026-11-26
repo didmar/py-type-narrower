@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from py_type_narrower.body_analysis import ParamGuardInfo, ReturnSummary
+    from py_type_narrower.class_analysis import ClassAttrFact
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
         ClassInfo,
@@ -167,7 +168,7 @@ def _evaluate_class_rules(
 ) -> None:
     """Run Tier 1 (NT104) and Tier 2 (NT203) rules on a single ClassInfo."""
     if ctx.config.max_tier >= Tier.LOCAL and RuleCode.NT104 in ctx.active:
-        out.extend(_rule_nt104_always_initialized_attrs(cls))
+        out.extend(_rule_nt104_always_initialized_attrs(cls, ctx))
     if ctx.config.max_tier >= Tier.WHOLE_REPO and RuleCode.NT203 in ctx.active:
         out.extend(_rule_nt203_structured_fields(cls, ctx.index, ctx.config))
 
@@ -501,43 +502,161 @@ def _try_enum_member_return_candidate(
     )
 
 
-def _rule_nt104_always_initialized_attrs(cls: ClassInfo) -> list[NarrowingCandidate]:
-    """NT104: Class attribute `T | None` is always initialized non-None and never set to None."""
+def _rule_nt104_always_initialized_attrs(
+    cls: ClassInfo,
+    ctx: _RuleEvalContext,
+) -> list[NarrowingCandidate]:
+    """NT104: Class attributes narrowable via class-local Optional, Literal, or Union analysis."""
+    has_subclasses = _class_has_subclasses(cls, ctx.index)
     results: list[NarrowingCandidate] = []
     for fact in cls.attr_facts:
+        cand = _evaluate_single_attr_fact(cls, fact, ctx.config, has_subclasses=has_subclasses)
+        if cand is not None:
+            results.append(cand)
+    return results
+
+
+def _evaluate_single_attr_fact(
+    cls: ClassInfo,
+    fact: ClassAttrFact,
+    config: NarrowerConfig,
+    *,
+    has_subclasses: bool,
+) -> NarrowingCandidate | None:
+    """Turn a ClassAttrFact (optional, literal, or union) into an NT104 candidate if eligible."""
+    if fact.kind == "optional" and fact.optional_inner is not None:
         loc_note = "in `__init__`" if fact.declared_in_init else "on class body and `__init__`"
-        results.append(
-            NarrowingCandidate(
-                code=RuleCode.NT104,
-                tier=Tier.LOCAL,
+        return NarrowingCandidate(
+            code=RuleCode.NT104,
+            tier=Tier.LOCAL,
+            file=cls.file,
+            line=fact.line,
+            col=fact.col,
+            symbol=cls.qualname,
+            target_kind=TargetKind.ATTRIBUTE,
+            target_name=fact.name,
+            current_type=fact.annotation_str,
+            suggested_type=fact.optional_inner,
+            needs_literal_import=False,
+            message=(
+                f"Attribute `{cls.name}.{fact.name}` is `{fact.annotation_str}`, "
+                f"but is always initialized non-None in `__init__` and never assigned None; "
+                f"narrow to `{fact.optional_inner}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="class_attr_analysis",
+                    detail=f"Always assigned non-None {loc_note} and never mutated to None",
+                    file=cls.file,
+                    line=fact.line,
+                )
+            ],
+            score=score_tier1_always_initialized_attr(is_private=cls.is_private),
+            is_public=not cls.is_private,
+            drop_none_default=fact.has_none_default,
+        )
+    if has_subclasses:
+        return None
+    if fact.kind == "literal":
+        return _nt104_literal_attr_candidate(cls, fact, config)
+    if fact.kind == "union":
+        return _nt104_union_attr_candidate(cls, fact)
+    return None
+
+
+def _nt104_literal_attr_candidate(
+    cls: ClassInfo,
+    fact: ClassAttrFact,
+    config: NarrowerConfig,
+) -> NarrowingCandidate | None:
+    """Build an NT104 candidate for a class attribute only assigned constant str/int literals."""
+    if fact.primitive_kind is None:
+        return None
+    matching = filter_literals_by_kind(set(fact.observed_literals), fact.primitive_kind)
+    if (
+        len(matching) != len(fact.observed_literals)
+        or not matching
+        or len(matching) > config.max_literals
+        or _has_prose_or_overlong_literal(matching)
+    ):
+        return None
+    # Avoid narrowing a public mutable field initialized to a single sentinel (e.g. `title: str = ""`)
+    # unless the attribute is private, closed-world is enabled, or multiple states are observed.
+    is_attr_private = fact.name.startswith("_") or cls.is_private
+    if len(matching) == 1 and not is_attr_private and not config.closed_world:
+        return None
+
+    suggested = format_literal_type(matching)
+    return NarrowingCandidate(
+        code=RuleCode.NT104,
+        tier=Tier.LOCAL,
+        file=cls.file,
+        line=fact.line,
+        col=fact.col,
+        symbol=cls.qualname,
+        target_kind=TargetKind.ATTRIBUTE,
+        target_name=fact.name,
+        current_type=fact.annotation_str,
+        suggested_type=suggested,
+        needs_literal_import=True,
+        message=(
+            f"Attribute `{cls.name}.{fact.name}` is `{fact.annotation_str}`, "
+            f"but is only assigned {suggested} across class methods"
+        ),
+        evidence=[
+            EvidenceItem(
+                kind="class_attr_literals",
+                detail=f"All assignments to `self.{fact.name}` use literals in {suggested}",
                 file=cls.file,
                 line=fact.line,
-                col=fact.col,
-                symbol=cls.qualname,
-                target_kind=TargetKind.ATTRIBUTE,
-                target_name=fact.name,
-                current_type=fact.annotation_str,
-                suggested_type=fact.optional_inner,
-                needs_literal_import=False,
-                message=(
-                    f"Attribute `{cls.name}.{fact.name}` is `{fact.annotation_str}`, "
-                    f"but is always initialized non-None in `__init__` and never assigned None; "
-                    f"narrow to `{fact.optional_inner}`"
-                ),
-                evidence=[
-                    EvidenceItem(
-                        kind="class_attr_analysis",
-                        detail=f"Always assigned non-None {loc_note} and never mutated to None",
-                        file=cls.file,
-                        line=fact.line,
-                    )
-                ],
-                score=score_tier1_always_initialized_attr(is_private=cls.is_private),
-                is_public=not cls.is_private,
-                drop_none_default=fact.has_none_default,
             )
-        )
-    return results
+        ],
+        score=score_tier1_always_initialized_attr(is_private=is_attr_private),
+        is_public=not is_attr_private,
+        is_single_constant=len(matching) == 1,
+    )
+
+
+def _nt104_union_attr_candidate(
+    cls: ClassInfo,
+    fact: ClassAttrFact,
+) -> NarrowingCandidate | None:
+    """Build an NT104 candidate for a union class attribute with unused non-None branch(es)."""
+    used, unused = _partition_union_members(fact.union_members, set(fact.observed_types))
+    if not used or not unused or unused == ["None"] or used == ["None"]:
+        return None
+    suggested = format_union_type(used)
+    drops_none = "None" in unused and fact.has_none_default
+    return NarrowingCandidate(
+        code=RuleCode.NT104,
+        tier=Tier.LOCAL,
+        file=cls.file,
+        line=fact.line,
+        col=fact.col,
+        symbol=cls.qualname,
+        target_kind=TargetKind.ATTRIBUTE,
+        target_name=fact.name,
+        current_type=fact.annotation_str,
+        suggested_type=suggested,
+        needs_literal_import=False,
+        message=(
+            f"Attribute `{cls.name}.{fact.name}` is `{fact.annotation_str}`, "
+            f"but branch(es) {', '.join(unused)} are never assigned; narrow to `{suggested}`"
+        ),
+        evidence=[
+            EvidenceItem(
+                kind="class_attr_union",
+                detail=f"Observed assigned types: {', '.join(sorted(fact.observed_types))}",
+                file=cls.file,
+                line=fact.line,
+            )
+        ],
+        score=score_tier1_always_initialized_attr(
+            is_private=fact.name.startswith("_") or cls.is_private
+        ),
+        is_public=not (fact.name.startswith("_") or cls.is_private),
+        drop_none_default=drops_none,
+    )
 
 
 def _rule_nt105_unused_union_return(

@@ -598,3 +598,38 @@ def caller() -> None:
     assert "def pick_status(flag: bool) -> Status:" in rewritten
     assert "def pick_level(flag: bool) -> Level:" in rewritten
     assert "def _record(status: Status) -> int:" in rewritten
+
+
+def test_nt104_extends_to_literal_and_union_class_attributes(tmp_path: Path) -> None:
+    code = """class Job:
+    def __init__(self) -> None:
+        self.state: str = "idle"
+        self._kind: str = "batch"
+        self.title: str = ""
+        self.result: int | str | bytes = 0
+
+    def start(self) -> None:
+        self.state = "running"
+
+    def finish(self) -> None:
+        self.state = "done"
+        self.result = "ok"
+"""
+    mod = tmp_path / "job.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt104 = {c.target_name: c for c in cands if c.code == RuleCode.NT104}
+
+    # Public multi-state FSM (`state`), private literal (`_kind`), and unused-branch union (`result`)
+    # are narrowed; public single-sentinel `title: str = ""` is skipped in open-world mode.
+    assert set(nt104.keys()) == {"state", "_kind", "result"}
+    assert nt104["state"].suggested_type == 'Literal["done", "idle", "running"]'
+    assert nt104["_kind"].suggested_type == 'Literal["batch"]'
+    assert nt104["result"].suggested_type == "int | str"
+
+    rewritten = rewrite_module_source(code, list(nt104.values()))
+    assert '        self.state: Literal["done", "idle", "running"] = "idle"' in rewritten
+    assert '        self._kind: Literal["batch"] = "batch"' in rewritten
+    assert "        self.result: int | str = 0" in rewritten
+    assert '        self.title: str = ""' in rewritten
