@@ -2,6 +2,43 @@
 
 A LibCST-powered static analyzer and refactoring tool that detects overly broad Python type annotations (like `str`, `int`, `bool`, `T | None`, or `A | B | C`) and suggests or applies narrower types (like `Literal["a", "b"]`, `T`, or `A | B`), with optional **soundness verification** backed by your preferred type checker (`ty`, `mypy`, `pyright`, `basedpyright`, or a custom command).
 
+## Installation
+
+```bash
+# Run without installing
+uvx py-type-narrower check .
+
+# Or install as a CLI tool
+uv tool install py-type-narrower
+
+# Or with pip
+pip install py-type-narrower
+```
+
+Requires Python 3.12+.
+
+## Quick Example
+
+```python
+# Before
+def format_status(mode: str, code: int) -> str | None:
+    if mode not in ("short", "long"):
+        raise ValueError(f"Unknown mode: {mode}")
+    return f"{mode}:{code}"
+```
+
+Running `py-type-narrower fix . --verify` narrows both annotations and adds the `Literal` import:
+
+```python
+from typing import Literal
+
+# After
+def format_status(mode: Literal["long", "short"], code: int) -> str:
+    if mode not in ("short", "long"):
+        raise ValueError(f"Unknown mode: {mode}")
+    return f"{mode}:{code}"
+```
+
 ## Design Philosophy & Non-Goals
 
 `py-type-narrower` is built to **complement** static type checkers (`ty`, `mypy`, `pyright`), not replace or duplicate them. Standard type checkers verify *soundness* and deliberately permit annotations that are looser than actual usage.
@@ -28,7 +65,7 @@ Rules are split into two tiers by evidence strength:
 | `NT204` | 2 (Whole-repo) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
 | `NT205` | 2 (Whole-repo) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
 
-Parameter narrowing automatically skips subclass method overrides, `Protocol`s, `ABC`s, `@abstractmethod`s, and Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, etc.) to avoid breaking Liskov substitution.
+Narrowing automatically skips `@no_type_check` code, `Protocol`s, `ABC`s, `@abstractmethod`s, subclass overrides, overridden base-class return hooks, PEP 562 module hooks (`__getattr__`, `__dir__`), and fixed Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, `__getattr__`, etc.) to preserve Liskov substitution and runtime contracts.
 
 ## Usage
 
@@ -104,6 +141,17 @@ Install with the `flake8` extra to expose Tier 1 (`NT101`–`NT105`) single-file
 ```bash
 pip install "py-type-narrower[flake8]"
 flake8 your_package/
+```
+
+### Pre-commit
+
+```yaml
+repos:
+  - repo: https://github.com/didmar/py-type-narrower
+    rev: v0.1.0
+    hooks:
+      - id: py-type-narrower-check
+        args: ["--tier", "1"]
 ```
 
 ## Development
