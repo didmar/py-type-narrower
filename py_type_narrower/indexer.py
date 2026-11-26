@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal as TypingLiteral
 
 import libcst as cst
@@ -266,30 +267,94 @@ def index_files(
 
 
 def discover_python_files(paths: list[Path], exclude: list[str]) -> list[Path]:
-    """Recursively collect `.py` files from files/directories while honoring excludes."""
-    exclude_set = set(exclude)
+    """Recursively collect `.py` files from files/directories while pruning excluded subtrees."""
+    plain_excludes, glob_excludes = _split_exclude_patterns(exclude)
     found: set[Path] = set()
     for raw_path in paths:
         path = raw_path.resolve()
         if path.is_file() and path.suffix == ".py":
             found.add(path)
         elif path.is_dir():
-            for py_file in path.rglob("*.py"):
-                if not _is_excluded(py_file, path, exclude_set):
-                    found.add(py_file.resolve())
+            for root_dir, dirnames, filenames in path.walk():
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not _is_dir_excluded(root_dir / d, path, plain_excludes, glob_excludes)
+                ]
+                for filename in filenames:
+                    if not filename.endswith(".py"):
+                        continue
+                    py_file = root_dir / filename
+                    if not _is_file_excluded(py_file, path, plain_excludes, glob_excludes):
+                        found.add(py_file.resolve())
     return sorted(found)
 
 
-def _is_excluded(file_path: Path, base: Path, exclude_set: set[str]) -> bool:
-    """Return True if any relative path component is hidden or matches the exclude list."""
+def _split_exclude_patterns(exclude: list[str]) -> tuple[set[str], list[str]]:
+    """Split exclude entries into exact component names and path/glob patterns."""
+    plain: set[str] = set()
+    globs: list[str] = []
+    for raw in exclude:
+        pat = raw.strip().rstrip("/")
+        if not pat:
+            continue
+        if any(ch in pat for ch in ("/", "*", "?", "[")):
+            globs.append(pat)
+        else:
+            plain.add(pat)
+    return (plain, globs)
+
+
+def _is_dir_excluded(
+    dir_path: Path,
+    base: Path,
+    plain_excludes: set[str],
+    glob_excludes: list[str],
+) -> bool:
+    """Return True if a directory should be pruned during recursive discovery."""
+    name = dir_path.name
+    if name in plain_excludes or (name.startswith(".") and name not in {".", ".."}):
+        return True
+    rel_posix = _relative_posix(dir_path, base)
+    return _matches_glob_patterns(rel_posix, glob_excludes, is_dir=True)
+
+
+def _is_file_excluded(
+    file_path: Path,
+    base: Path,
+    plain_excludes: set[str],
+    glob_excludes: list[str],
+) -> bool:
+    """Return True if a file matches any exact name or path/glob exclude pattern."""
+    if file_path.name in plain_excludes:
+        return True
+    if not glob_excludes:
+        return False
+    rel_posix = _relative_posix(file_path, base)
+    return _matches_glob_patterns(rel_posix, glob_excludes, is_dir=False)
+
+
+def _relative_posix(path: Path, base: Path) -> str:
+    """Return a POSIX-style path relative to `base` (or full POSIX path if outside `base`)."""
     try:
-        rel_parts = file_path.relative_to(base).parts
+        return path.relative_to(base).as_posix()
     except ValueError:
-        rel_parts = file_path.parts
-    return any(
-        part in exclude_set or (part.startswith(".") and part not in {".", ".."})
-        for part in rel_parts[:-1]
-    ) or (bool(rel_parts) and rel_parts[-1] in exclude_set)
+        return path.as_posix()
+
+
+def _matches_glob_patterns(rel_posix: str, glob_excludes: list[str], *, is_dir: bool) -> bool:
+    """Return True if `rel_posix` matches any glob or relative-path exclude pattern."""
+    pure = PurePosixPath(rel_posix)
+    for pat in glob_excludes:
+        if pat.endswith("/**"):
+            prefix = pat[:-3].rstrip("/")
+            if rel_posix == prefix or rel_posix.startswith(prefix + "/"):
+                return True
+        if fnmatch.fnmatch(rel_posix, pat) or pure.match(pat):
+            return True
+        if is_dir and (rel_posix == pat or fnmatch.fnmatch(f"{rel_posix}/", pat)):
+            return True
+    return False
 
 
 def _read_source(path: Path, overrides: dict[Path, str] | None) -> str | None:

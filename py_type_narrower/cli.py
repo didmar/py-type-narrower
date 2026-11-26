@@ -131,6 +131,19 @@ def _add_common_options(subparser: argparse.ArgumentParser) -> None:
         help="Comma-separated rule codes to ignore (e.g. NT201)",
     )
     subparser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="Additional directory/file name or glob pattern to exclude (repeatable)",
+    )
+    subparser.add_argument(
+        "--no-project-index",
+        action="store_false",
+        dest="index_project_root",
+        default=None,
+        help="Only index the explicitly passed paths instead of the full project root for Tier 2",
+    )
+    subparser.add_argument(
         "--max-literals",
         type=int,
         default=None,
@@ -210,6 +223,10 @@ def _apply_cli_overrides(config: NarrowerConfig, args: argparse.Namespace) -> No
         config.select = _parse_csv_codes(args.select)
     if args.ignore is not None:
         config.ignore = _parse_csv_codes(args.ignore)
+    if args.exclude is not None:
+        config.exclude.extend(args.exclude)
+    if args.index_project_root is False:
+        config.index_project_root = False
 
 
 def _parse_csv_codes(raw: str) -> set[RuleCode]:

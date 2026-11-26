@@ -118,7 +118,7 @@ def _resolve_index_files(
     has_tier2 = config.max_tier >= Tier.WHOLE_REPO and any(
         rule.tier == Tier.WHOLE_REPO for rule in config.active_rules()
     )
-    if not has_tier2:
+    if not has_tier2 or not config.index_project_root:
         return target_files
     project_files = discover_python_files([project_root], config.exclude)
     return sorted({*project_files, *target_files})

@@ -6,6 +6,7 @@ from py_type_narrower.cli import main
 from py_type_narrower.config import NarrowerConfig, load_config
 from py_type_narrower.engine import RunOptions, analyze_paths
 from py_type_narrower.flake8_plugin import TypeNarrowerChecker
+from py_type_narrower.indexer import discover_python_files
 from py_type_narrower.models import RuleCode
 
 
@@ -229,3 +230,30 @@ def build_cfg() -> dict[str, Any]:
     res = sarif["runs"][0]["results"][0]
     assert res["level"] == "note"
     assert res["properties"]["fixable"] is False
+
+
+def test_glob_excludes_and_no_project_index_cli(tmp_path: Path, capsys) -> None:
+    (tmp_path / "src").mkdir()
+    keep = tmp_path / "src" / "keep.py"
+    keep.write_text("def f(mode: str) -> int:\n    return len(mode)\n", encoding="utf-8")
+    gen = tmp_path / "src" / "foo_pb2.py"
+    gen.write_text("x = 1\n", encoding="utf-8")
+    bench_dir = tmp_path / "tests" / "benchmarks" / "corpus"
+    bench_dir.mkdir(parents=True)
+    (bench_dir / "heavy.py").write_text("y = 2\n", encoding="utf-8")
+    caller = tmp_path / "caller.py"
+    caller.write_text(
+        'from src.keep import f\ndef run() -> None:\n    f("a")\n    f("b")\n',
+        encoding="utf-8",
+    )
+
+    discovered = discover_python_files(
+        [tmp_path],
+        exclude=["tests/benchmarks/**", "*_pb2.py"],
+    )
+    assert discovered == sorted([caller.resolve(), keep.resolve()])
+
+    # With --no-project-index, checking only src/keep.py ignores caller.py outside paths.
+    rc = main(["check", str(keep), "--closed-world", "--no-project-index"])
+    _ = capsys.readouterr()
+    assert rc == 0
