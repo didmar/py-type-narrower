@@ -39,6 +39,7 @@ ABSTRACT_BASE_NAMES: frozenset[str] = frozenset(
     {"ABC", "Protocol", "abc.ABC", "typing.Protocol", "typing_extensions.Protocol"}
 )
 NAMEDTUPLE_BASE_NAMES: frozenset[str] = frozenset({"NamedTuple", "typing.NamedTuple"})
+PYDANTIC_BASE_NAMES: frozenset[str] = frozenset({"BaseModel", "pydantic.BaseModel"})
 TYPEDDICT_BASE_NAMES: frozenset[str] = frozenset(
     {"TypedDict", "typing.TypedDict", "typing_extensions.TypedDict"}
 )
@@ -48,6 +49,7 @@ ENUM_BASE_NAMES: frozenset[str] = frozenset({"Enum", "enum.Enum"})
 TRIVIAL_BASE_NAMES: frozenset[str] = (
     ABSTRACT_BASE_NAMES
     | NAMEDTUPLE_BASE_NAMES
+    | PYDANTIC_BASE_NAMES
     | TYPEDDICT_BASE_NAMES
     | STRENUM_BASE_NAMES
     | INTENUM_BASE_NAMES
@@ -170,6 +172,8 @@ class ClassInfo:
     is_protocol_or_abc: bool = False
     is_dataclass: bool = False
     is_namedtuple: bool = False
+    is_attrs: bool = False
+    is_pydantic: bool = False
     is_typeddict: bool = False
     typeddict_total: bool = True
     is_kw_only_dataclass: bool = False
@@ -178,6 +182,17 @@ class ClassInfo:
     enum_values: frozenset[ExtractedLiteral] = field(default_factory=frozenset)
     fields: list[FieldInfo] = field(default_factory=list)
     attr_facts: list[ClassAttrFact] = field(default_factory=list)
+
+    @property
+    def is_structured_model(self) -> bool:
+        """Return True if this class is a dataclass, NamedTuple, attrs, Pydantic, or TypedDict."""
+        return (
+            self.is_dataclass
+            or self.is_namedtuple
+            or self.is_attrs
+            or self.is_pydantic
+            or self.is_typeddict
+        )
 
 
 @dataclass
@@ -442,8 +457,11 @@ class _DefinitionCollector(cst.CSTVisitor):
         bases = [expr_to_code(arg.value) for arg in node.bases]
         is_proto_abc = any(base in ABSTRACT_BASE_NAMES for base in bases)
         is_dataclass, is_kw_only_dc = _inspect_dataclass_decorator(node)
+        is_attrs, is_kw_only_attrs = _inspect_attrs_decorator(node)
         is_namedtuple = any(base in NAMEDTUPLE_BASE_NAMES for base in bases)
+        is_pydantic = any(base in PYDANTIC_BASE_NAMES for base in bases)
         is_typeddict = any(base in TYPEDDICT_BASE_NAMES for base in bases)
+        is_structured = is_dataclass or is_attrs or is_namedtuple or is_pydantic or is_typeddict
         typeddict_total = _extract_typeddict_total(node) if is_typeddict else True
         enum_kind = _detect_enum_kind(bases)
         enum_members, enum_values = (
@@ -463,16 +481,16 @@ class _DefinitionCollector(cst.CSTVisitor):
         fields = (
             self._extract_structured_fields(
                 node,
-                is_kw_only_dc=is_kw_only_dc,
+                is_kw_only_dc=is_kw_only_dc or is_kw_only_attrs or is_pydantic,
                 is_typeddict=is_typeddict,
                 typeddict_total=typeddict_total,
             )
-            if (is_dataclass or is_namedtuple or is_typeddict)
+            if is_structured
             else []
         )
         attr_facts = (
             analyze_class_attributes(node, self.known_class_names, self._node_position)
-            if not (is_proto_abc or is_dataclass or is_namedtuple or is_typeddict or enum_kind)
+            if not (is_proto_abc or is_structured or enum_kind)
             else []
         )
         cls_info = ClassInfo(
@@ -488,9 +506,11 @@ class _DefinitionCollector(cst.CSTVisitor):
             is_protocol_or_abc=is_proto_abc,
             is_dataclass=is_dataclass,
             is_namedtuple=is_namedtuple,
+            is_attrs=is_attrs,
+            is_pydantic=is_pydantic,
             is_typeddict=is_typeddict,
             typeddict_total=typeddict_total,
-            is_kw_only_dataclass=is_kw_only_dc,
+            is_kw_only_dataclass=is_kw_only_dc or is_kw_only_attrs or is_pydantic,
             enum_kind=enum_kind,
             enum_members=enum_members,
             enum_values=enum_values,
@@ -560,8 +580,10 @@ class _DefinitionCollector(cst.CSTVisitor):
         default_is_none = False
         default_lit: ExtractedLiteral | None = None
 
-        if val is not None and _is_dataclass_field_call(val):
-            init_flag, dc_has_default, dc_kw_only = _parse_dataclass_field_call(val)
+        if val is not None and _is_structured_field_call(val):
+            init_flag, dc_has_default, dc_kw_only, default_is_none, default_lit = (
+                _parse_structured_field_call(val)
+            )
             if not init_flag:
                 return None
             has_default = dc_has_default
@@ -1002,32 +1024,88 @@ def _inspect_dataclass_decorator(node: cst.ClassDef) -> tuple[bool, bool]:
     return (False, False)
 
 
-def _is_dataclass_field_call(expr: cst.BaseExpression) -> bool:
-    """Return True if expr is a `field(...)` or `dataclasses.field(...)` call."""
+_ATTRS_DECORATOR_NAMES: frozenset[str] = frozenset(
+    {
+        "define",
+        "attrs.define",
+        "frozen",
+        "attrs.frozen",
+        "mutable",
+        "attrs.mutable",
+        "attr.s",
+        "attr.attrs",
+        "attrs.attrs",
+    }
+)
+
+
+def _inspect_attrs_decorator(node: cst.ClassDef) -> tuple[bool, bool]:
+    """Return `(is_attrs, is_kw_only)` from attrs class decorators."""
+    for dec in node.decorators:
+        expr = dec.decorator
+        kw_only = False
+        if isinstance(expr, cst.Call):
+            for arg in expr.args:
+                if (
+                    arg.keyword is not None
+                    and arg.keyword.value == "kw_only"
+                    and isinstance(arg.value, cst.Name)
+                    and arg.value.value == "True"
+                ):
+                    kw_only = True
+            expr = expr.func
+        if expr_to_code(expr) in _ATTRS_DECORATOR_NAMES:
+            return (True, kw_only)
+    return (False, False)
+
+
+def _is_structured_field_call(expr: cst.BaseExpression) -> bool:
+    """Return True if expr is a dataclass, attrs, or Pydantic field specification call."""
     if not isinstance(expr, cst.Call):
         return False
     code = expr_to_code(expr.func)
-    return code in {"field", "dataclasses.field"}
+    return code in {
+        "field",
+        "dataclasses.field",
+        "attrs.field",
+        "attr.field",
+        "attr.ib",
+        "Field",
+        "pydantic.Field",
+    }
 
 
-def _parse_dataclass_field_call(expr: cst.BaseExpression) -> tuple[bool, bool, bool]:
-    """Parse `(init, has_default, kw_only)` from a `dataclasses.field(...)` call."""
+def _parse_structured_field_call(
+    expr: cst.BaseExpression,
+) -> tuple[bool, bool, bool, bool, ExtractedLiteral | None]:
+    """Parse `(init, has_default, kw_only, default_is_none, default_lit)` from a field() call."""
     if not isinstance(expr, cst.Call):
-        return (True, False, False)
+        return (True, False, False, False, None)
     init_flag = True
     has_default = False
     kw_only = False
-    for arg in expr.args:
+    default_is_none = False
+    default_lit: ExtractedLiteral | None = None
+    for idx, arg in enumerate(expr.args):
+        if arg.keyword is None and idx == 0 and not isinstance(arg.value, cst.Ellipsis):
+            has_default = True
+            default_is_none = is_none_expr(arg.value)
+            default_lit = extract_literal(arg.value)
+            continue
         if arg.keyword is None:
             continue
         kw = arg.keyword.value
         if kw == "init" and isinstance(arg.value, cst.Name) and arg.value.value == "False":
             init_flag = False
-        elif kw in {"default", "default_factory"}:
+        elif kw == "default" and not isinstance(arg.value, cst.Ellipsis):
+            has_default = True
+            default_is_none = is_none_expr(arg.value)
+            default_lit = extract_literal(arg.value)
+        elif kw in {"default_factory", "factory"}:
             has_default = True
         elif kw == "kw_only" and isinstance(arg.value, cst.Name) and arg.value.value == "True":
             kw_only = True
-    return (init_flag, has_default, kw_only)
+    return (init_flag, has_default, kw_only, default_is_none, default_lit)
 
 
 class _CallSiteCollector(cst.CSTVisitor):
@@ -1045,6 +1123,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         self.index = index
         self._classes_by_short_name = classes_by_short_name
         self._class_stack: list[str] = []
+        self._return_typeddict_stack: list[ClassInfo | None] = []
         # Each entry is `(is_class_scope, bindings)`; class scopes do not enclose methods in Python.
         self._scope_stack: list[tuple[bool, dict[str, _LocalVarBinding]]] = [(False, {})]
 
@@ -1074,10 +1153,30 @@ class _CallSiteCollector(cst.CSTVisitor):
                 inferred_type=ann_str,
             )
         self._scope_stack.append((False, scope))
+        ret_td: ClassInfo | None = None
+        if node.returns is not None:
+            ret_ref = expr_to_code(node.returns.annotation).strip("'\"")
+            candidate = self._lookup_class_by_ref(ret_ref)
+            if candidate is not None and candidate.is_typeddict:
+                ret_td = candidate
+        self._return_typeddict_stack.append(ret_td)
         return True
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:  # noqa: ARG002, N802
         self._scope_stack.pop()
+        self._return_typeddict_stack.pop()
+
+    def visit_Return(self, node: cst.Return) -> bool:  # noqa: N802
+        if (
+            self._return_typeddict_stack
+            and self._return_typeddict_stack[-1] is not None
+            and isinstance(node.value, cst.Dict)
+        ):
+            pos = self.get_metadata(PositionProvider, node)
+            self._bind_typeddict_literal(
+                self._return_typeddict_stack[-1], node.value, pos.start.line
+            )
+        return True
 
     def visit_Assign(self, node: cst.Assign) -> bool:  # noqa: N802
         if len(node.targets) == 1:
@@ -1086,6 +1185,8 @@ class _CallSiteCollector(cst.CSTVisitor):
                 self._record_var_value(target.value, node.value, annotation=None)
             elif isinstance(target, cst.Attribute):
                 self._record_attr_write(target, node.value)
+            elif isinstance(target, cst.Subscript):
+                self._record_typeddict_subscript_write(target, node.value)
             else:
                 self._bind_unknown_target(target)
         else:
@@ -1096,6 +1197,12 @@ class _CallSiteCollector(cst.CSTVisitor):
     def visit_AnnAssign(self, node: cst.AnnAssign) -> bool:  # noqa: N802
         if isinstance(node.target, cst.Name):
             self._record_var_value(node.target.value, node.value, annotation=node.annotation)
+            if isinstance(node.value, cst.Dict):
+                ann_ref = expr_to_code(node.annotation.annotation).strip("'\"")
+                td_cls = self._lookup_class_by_ref(ann_ref)
+                if td_cls is not None and td_cls.is_typeddict:
+                    pos = self.get_metadata(PositionProvider, node)
+                    self._bind_typeddict_literal(td_cls, node.value, pos.start.line)
         return True
 
     def visit_AugAssign(self, node: cst.AugAssign) -> bool:  # noqa: N802
@@ -1142,12 +1249,12 @@ class _CallSiteCollector(cst.CSTVisitor):
         return True
 
     def _record_attr_write(self, target: cst.Attribute, value: cst.BaseExpression) -> None:
-        """Record `obj.field = value` writes against indexed dataclass fields."""
+        """Record `obj.field = value` writes against indexed structured-model fields."""
         if not isinstance(target.value, cst.Name):
             return
         receiver = target.value.value
         cls_info = self._resolve_receiver_class(receiver)
-        if cls_info is None or not (cls_info.is_dataclass or cls_info.is_namedtuple):
+        if cls_info is None or not cls_info.is_structured_model:
             return
         field_name = target.attr.value
         if any(f.name == field_name for f in cls_info.fields):
@@ -1156,6 +1263,68 @@ class _CallSiteCollector(cst.CSTVisitor):
                 (cls_info.qualname, field_name), ParamCallStats()
             )
             stats.observations.append(self._classify_arg_expr(value, pos.start.line))
+
+    def _record_typeddict_subscript_write(
+        self,
+        target: cst.Subscript,
+        value: cst.BaseExpression,
+    ) -> None:
+        """Record `td_var["key"] = value` writes against indexed TypedDict fields."""
+        if not isinstance(target.value, cst.Name) or len(target.slice) != 1:
+            return
+        cls_info = self._resolve_receiver_class(target.value.value)
+        if cls_info is None or not cls_info.is_typeddict:
+            return
+        first = target.slice[0].slice
+        if not isinstance(first, cst.Index):
+            return
+        key_lit = extract_literal(first.value)
+        if key_lit is None or key_lit.kind != "str" or not isinstance(key_lit.value, str):
+            return
+        field_name = key_lit.value
+        if any(f.name == field_name for f in cls_info.fields):
+            pos = self.get_metadata(PositionProvider, target)
+            stats = self.index.field_stats.setdefault(
+                (cls_info.qualname, field_name), ParamCallStats()
+            )
+            stats.observations.append(self._classify_arg_expr(value, pos.start.line))
+
+    def _bind_typeddict_literal(self, target: ClassInfo, expr: cst.Dict, line: int) -> None:
+        """Bind keys/values of a dict literal typed as `target` TypedDict onto field_stats."""
+        fields = target.fields
+        by_name = {f.name: f for f in fields}
+        if any(not isinstance(el, cst.DictElement) for el in expr.elements):
+            for f in fields:
+                stats = self.index.field_stats.setdefault(
+                    (target.qualname, f.name), ParamCallStats()
+                )
+                stats.has_dynamic_star_call = True
+            return
+
+        bound: set[str] = set()
+        for el in expr.elements:
+            if not isinstance(el, cst.DictElement):
+                continue
+            key_lit = extract_literal(el.key)
+            if key_lit is None or key_lit.kind != "str" or not isinstance(key_lit.value, str):
+                for f in fields:
+                    stats = self.index.field_stats.setdefault(
+                        (target.qualname, f.name), ParamCallStats()
+                    )
+                    stats.has_dynamic_star_call = True
+                return
+            key = key_lit.value
+            if key in by_name:
+                bound.add(key)
+                stats = self.index.field_stats.setdefault((target.qualname, key), ParamCallStats())
+                stats.observations.append(self._classify_arg_expr(el.value, line))
+
+        for fld in fields:
+            if fld.name not in bound:
+                stats = self.index.field_stats.setdefault(
+                    (target.qualname, fld.name), ParamCallStats()
+                )
+                stats.omitted_count += 1
 
     def _resolve_receiver_class(self, receiver: str) -> ClassInfo | None:
         """Resolve `self` or a typed local variable to its ClassInfo if indexed."""
@@ -1188,12 +1357,21 @@ class _CallSiteCollector(cst.CSTVisitor):
                 candidates.append(f"{mod}.{func_expr.attr.value}")
         for qual in candidates:
             cls = self.index.classes.get(qual)
-            if cls is not None and (cls.is_dataclass or cls.is_namedtuple) and cls.fields:
+            if cls is not None and cls.is_structured_model and cls.fields:
                 return cls
         return None
 
     def _bind_field_arguments(self, target: ClassInfo, call: cst.Call, line: int) -> None:
-        """Bind constructor call arguments onto dataclass / NamedTuple fields."""
+        """Bind constructor call arguments onto structured-model fields."""
+        if (
+            target.is_typeddict
+            and len(call.args) == 1
+            and call.args[0].keyword is None
+            and call.args[0].star == ""
+            and isinstance(call.args[0].value, cst.Dict)
+        ):
+            self._bind_typeddict_literal(target, call.args[0].value, line)
+            return
         fields = target.fields
         pos_fields = [f for f in fields if not f.is_kw_only]
         by_name = {f.name: f for f in fields}

@@ -1505,8 +1505,8 @@ def _rule_nt203_structured_fields(
     index: CodebaseIndex,
     config: NarrowerConfig,
 ) -> list[NarrowingCandidate]:
-    """NT203: Dataclass / NamedTuple field narrowing across constructor & assignment sites."""
-    if not (cls.is_dataclass or cls.is_namedtuple) or cls.is_protocol_or_abc or not cls.fields:
+    """NT203: Dataclass / NamedTuple / attrs / Pydantic / TypedDict field narrowing."""
+    if not cls.is_structured_model or cls.is_protocol_or_abc or not cls.fields:
         return []
     if _class_has_subclasses(cls, index):
         return []
@@ -1516,14 +1516,62 @@ def _rule_nt203_structured_fields(
         stats = index.field_stats.get((cls.qualname, fld.name))
         if stats is None or not stats.observations or stats.has_dynamic_star_call:
             continue
-        lit_cand = _check_field_literal(cls, fld, stats, config)
-        if lit_cand is not None:
-            results.append(lit_cand)
-            continue
-        opt_cand = _check_field_optional(cls, fld, stats, config)
-        if opt_cand is not None:
-            results.append(opt_cand)
+        for checker in (_check_field_not_required, _check_field_literal, _check_field_optional):
+            cand = checker(cls, fld, stats, config)
+            if cand is not None:
+                results.append(cand)
+                break
     return results
+
+
+def _check_field_not_required(
+    cls: ClassInfo,
+    fld: FieldInfo,
+    stats: ParamCallStats,
+    config: NarrowerConfig,
+) -> NarrowingCandidate | None:
+    """Check if a TypedDict `NotRequired[T]` field is always supplied across instantiations."""
+    if not cls.is_typeddict or fld.not_required_inner is None or stats.omitted_count > 0:
+        return None
+    call_count = len(stats.observations)
+    only_test = all(obs.is_test_caller for obs in stats.observations)
+    score, notes = score_tier2_unused_optional_param(
+        OptionalParamScoreContext(
+            is_private=cls.is_private,
+            closed_world=config.closed_world,
+            call_count=call_count,
+            min_call_sites=config.min_call_sites,
+            only_test_callers=only_test,
+            has_none_default=False,
+        )
+    )
+    return NarrowingCandidate(
+        code=RuleCode.NT203,
+        tier=Tier.WHOLE_REPO,
+        file=cls.file,
+        line=fld.line,
+        col=fld.col,
+        symbol=cls.qualname,
+        target_kind=TargetKind.ATTRIBUTE,
+        target_name=fld.name,
+        current_type=fld.annotation_str,
+        suggested_type=fld.not_required_inner,
+        needs_literal_import=False,
+        message=(
+            f"TypedDict field `{cls.name}.{fld.name}` is `{fld.annotation_str}`, "
+            f"but is always provided across {call_count} instantiation(s); "
+            f"narrow to `{fld.not_required_inner}`"
+        ),
+        evidence=[
+            EvidenceItem(
+                kind="call_sites",
+                detail=f"Observed {call_count} instantiation(s), never omitted",
+            ),
+            *(EvidenceItem(kind="score_factor", detail=note) for note in notes),
+        ],
+        score=score,
+        is_public=not cls.is_private,
+    )
 
 
 def _check_field_literal(

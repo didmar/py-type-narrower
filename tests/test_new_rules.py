@@ -633,3 +633,64 @@ def test_nt104_extends_to_literal_and_union_class_attributes(tmp_path: Path) -> 
     assert '        self._kind: Literal["batch"] = "batch"' in rewritten
     assert "        self.result: int | str = 0" in rewritten
     assert '        self.title: str = ""' in rewritten
+
+
+def test_nt203_extends_to_attrs_pydantic_and_typeddict(tmp_path: Path) -> None:
+    code = """from typing import NotRequired, TypedDict
+
+import attrs
+from pydantic import BaseModel, Field
+
+@attrs.define
+class JobSpec:
+    kind: str
+    note: str | None = None
+
+class ApiConfig(BaseModel):
+    env: str
+    token: str | None = Field(default=None)
+
+class Payload(TypedDict):
+    action: str
+    version: NotRequired[int]
+    extra: NotRequired[str]
+
+def make_payload() -> Payload:
+    return {"action": "create", "version": 1, "extra": "x"}
+
+def produce() -> None:
+    JobSpec("sync", "ok")
+    JobSpec("async", "done")
+    ApiConfig(env="prod", token="abc")
+    ApiConfig(env="staging", token="def")
+    p: Payload = {"action": "update", "version": 2}
+    _ = p
+"""
+    mod = tmp_path / "models_ext.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    nt203 = {
+        (c.symbol.rsplit(".", maxsplit=1)[-1], c.target_name): c
+        for c in cands
+        if c.code == RuleCode.NT203
+    }
+
+    assert nt203[("JobSpec", "kind")].suggested_type == 'Literal["async", "sync"]'
+    assert nt203[("JobSpec", "note")].suggested_type == "str"
+    assert nt203[("ApiConfig", "env")].suggested_type == 'Literal["prod", "staging"]'
+    assert nt203[("ApiConfig", "token")].suggested_type == "str"
+    assert nt203[("ApiConfig", "token")].drop_none_default is True
+    assert nt203[("Payload", "action")].suggested_type == 'Literal["create", "update"]'
+    assert nt203[("Payload", "version")].suggested_type == "int"
+    # `extra` was omitted in `p`, so it must stay NotRequired[str]
+    assert ("Payload", "extra") not in nt203
+
+    rewritten = rewrite_module_source(code, list(nt203.values()))
+    assert '    kind: Literal["async", "sync"]\n' in rewritten
+    assert "    note: str\n" in rewritten
+    assert '    env: Literal["prod", "staging"]\n' in rewritten
+    assert "    token: str\n" in rewritten
+    assert '    action: Literal["create", "update"]\n' in rewritten
+    assert "    version: int\n" in rewritten
+    assert "    extra: NotRequired[str]\n" in rewritten
