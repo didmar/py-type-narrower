@@ -1,9 +1,10 @@
 from pathlib import Path
 
+import libcst as cst
 import pytest
 
 from py_type_narrower.config import NarrowerConfig
-from py_type_narrower.indexer import index_files
+from py_type_narrower.indexer import discover_python_files, index_files
 from py_type_narrower.models import RuleCode
 from py_type_narrower.rules import run_rules
 
@@ -368,3 +369,53 @@ class ReadOnlyList:
 """
     cands = _run_on_code(tmp_path, code, max_tier=2)
     assert cands == []
+
+
+def test_hard_negative_generic_base_subclass_and_single_int_sentinel(tmp_path: Path) -> None:
+    code = """from decimal import Decimal
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class ApproxScalar(Generic[T]):
+    DEFAULT_TOL: float | Decimal = 1e-12
+
+    def __init__(self, expected: T) -> None:
+        self.expected = expected
+
+class ApproxDecimal(ApproxScalar[Decimal]):
+    DEFAULT_TOL = Decimal("1e-12")
+
+class TreeNode:
+    def __init__(self) -> None:
+        self._line: int = -1
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=1)
+    assert [c for c in cands if c.code == RuleCode.NT104] == []
+
+
+def test_indexer_skips_hidden_dirs_and_libcst_logic_errors(tmp_path: Path, monkeypatch) -> None:
+    hidden = tmp_path / ".corpus" / "repo"
+    hidden.mkdir(parents=True)
+    (hidden / "bad.py").write_text("x = 1\n", encoding="utf-8")
+    good = tmp_path / "good.py"
+    good.write_text("def f() -> int:\n    return 1\n", encoding="utf-8")
+
+    discovered = discover_python_files([tmp_path], exclude=[])
+    assert discovered == [good.resolve()]
+
+    # Simulate LibCST raising CSTLogicError on a malformed fixture file
+    bad_file = tmp_path / "malformed.py"
+    bad_file.write_text("x = 1\n", encoding="utf-8")
+    real_parse = cst.parse_module
+
+    def flaky_parse(source: str) -> cst.Module:
+        if source == "x = 1\n":
+            msg = "simulated logic error"
+            raise cst.CSTLogicError(msg)
+        return real_parse(source)
+
+    monkeypatch.setattr(cst, "parse_module", flaky_parse)
+    index = index_files([good, bad_file], project_root=tmp_path)
+    assert good.resolve() in index.files
+    assert bad_file.resolve() not in index.files

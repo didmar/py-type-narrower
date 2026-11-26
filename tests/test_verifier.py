@@ -204,3 +204,31 @@ def test_ty_baseline_matches_materialized_package_subdirs(tmp_path: Path) -> Non
     verified, rejected = verify_candidates(cands, index.files, tmp_path, adapter)
     assert [c.code for c in verified] == [RuleCode.NT103]
     assert rejected == []
+
+
+def test_verifier_tolerates_preexisting_error_shifted_by_literal_import(tmp_path: Path) -> None:
+    """Inserting `from typing import Literal` shifts line numbers; pre-existing errors stay baseline."""
+    adapter = TyAdapter()
+    if not adapter.is_available():
+        pytest.skip("ty is not installed in PATH")
+
+    mod = tmp_path / "shifted.py"
+    mod.write_text(
+        """import nonexistent_third_party_pkg_xyz
+
+def _status(ok: bool) -> str:
+    if ok:
+        return "ok"
+    return "err"
+""",
+        encoding="utf-8",
+    )
+
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    assert [c.code for c in cands] == [RuleCode.NT103]
+    assert cands[0].needs_literal_import is True
+
+    verified, rejected = verify_candidates(cands, index.files, tmp_path, adapter)
+    assert [c.code for c in verified] == [RuleCode.NT103]
+    assert rejected == []
