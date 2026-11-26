@@ -268,3 +268,64 @@ def run_other(hooks: HookManager) -> None:
     nt201 = [c for c in cands if c.code == RuleCode.NT201 and c.target_name == "event"]
     assert len(nt201) == 1
     assert nt201[0].suggested_type == 'Literal["post_lock", "pre_install", "pre_lock"]'
+
+
+def test_cross_file_return_type_propagation_for_call_args_and_factories(tmp_path: Path) -> None:
+    helpers = tmp_path / "helpers.py"
+    helpers.write_text(
+        """from typing import Literal, TypeVar
+
+T = TypeVar("T")
+
+class User:
+    pass
+
+class Emitter:
+    def emit(self, topic: str) -> None:
+        _ = topic
+
+def get_mode() -> Literal["fast", "safe"]:
+    return "fast"
+
+def get_user() -> User:
+    return User()
+
+def make_emitter() -> Emitter:
+    return Emitter()
+
+def identity(x: T) -> T:
+    return x
+""",
+        encoding="utf-8",
+    )
+    consumer = tmp_path / "consumer.py"
+    consumer.write_text(
+        """from helpers import User, get_mode, get_user, identity, make_emitter
+
+def _run(mode: str, user: User | None, tag: User | int | str, raw: int | None) -> None:
+    _ = (mode, user, tag, raw)
+
+def caller(maybe: int | None) -> None:
+    m = get_mode()
+    _run(get_mode(), get_user(), get_user(), identity(maybe))
+    _run(m, get_user(), 42, identity(maybe))
+    em = make_emitter()
+    em.emit("started")
+    em.emit("stopped")
+""",
+        encoding="utf-8",
+    )
+
+    index = index_files([helpers, consumer], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=2, closed_world=True))
+    by_target = {(c.symbol.rsplit(".", maxsplit=1)[-1], c.target_name, c.code): c for c in cands}
+
+    assert by_target[("_run", "mode", RuleCode.NT201)].suggested_type == 'Literal["fast", "safe"]'
+    assert by_target[("_run", "user", RuleCode.NT202)].suggested_type == "User"
+    assert by_target[("_run", "tag", RuleCode.NT204)].suggested_type == "User | int"
+    # TypeVar `identity(maybe)` must NOT falsely narrow `raw: int | None`!
+    assert ("_run", "raw", RuleCode.NT202) not in by_target
+    # Factory return `em = make_emitter()` resolves `em.emit(...)`!
+    assert by_target[("emit", "topic", RuleCode.NT201)].suggested_type == (
+        'Literal["started", "stopped"]'
+    )

@@ -1004,6 +1004,47 @@ def _is_symbol_private(
     return False
 
 
+@dataclass(frozen=True)
+class _CalleeReturnInfo:
+    """Resolved return-type facts for an indexed call expression `callee(...)`."""
+
+    return_type: str | None
+    is_non_none: bool
+    is_none: bool
+    literals: tuple[ExtractedLiteral, ...] | None
+    class_type: str | None
+    enum_qualname: str | None
+
+
+_KNOWN_CONCRETE_RETURN_BASES: frozenset[str] = frozenset(
+    {
+        "str",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+        "complex",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+        "Sequence",
+        "MutableSequence",
+        "Mapping",
+        "MutableMapping",
+        "Iterable",
+        "Iterator",
+        "Collection",
+        "AbstractSet",
+        "Generator",
+        "Path",
+        "Literal",
+        "None",
+    }
+)
+
+
 @dataclass
 class _LocalVarBinding:
     """Lightweight per-scope type/literal knowledge for a local variable or parameter."""
@@ -1493,6 +1534,7 @@ class _CallSiteCollector(cst.CSTVisitor):
             and ann_str != "None"
         )
         val_lit = extract_literal(value) if value is not None else None
+        val_lits: tuple[ExtractedLiteral, ...] | None = (val_lit,) if val_lit is not None else None
         val_non_none = value is not None and is_definitely_non_none_expr(value)
         val_type = infer_simple_expr_type(value) if value is not None else None
 
@@ -1504,11 +1546,21 @@ class _CallSiteCollector(cst.CSTVisitor):
                 val_type = ctor_name
                 val_non_none = True
 
+        if isinstance(value, cst.Call) and val_type is None:
+            call_ret = self._infer_indexed_call_return(value)
+            if call_ret is not None:
+                val_type = call_ret.return_type
+                val_non_none = val_non_none or call_ret.is_non_none
+                if val_lits is None and call_ret.literals is not None:
+                    val_lits = call_ret.literals
+                if class_type is None and call_ret.class_type is not None:
+                    class_type = call_ret.class_type
+
         inferred_type = ann_str or val_type
         existing = scope.get(var_name)
         if existing is not None:
             merged_lits = ann_lits or (
-                (val_lit,) if val_lit is not None and existing.literals == (val_lit,) else None
+                val_lits if val_lits is not None and existing.literals == val_lits else None
             )
             merged_type = (
                 inferred_type
@@ -1523,7 +1575,7 @@ class _CallSiteCollector(cst.CSTVisitor):
             )
             return
 
-        lits = ann_lits or ((val_lit,) if val_lit is not None else None)
+        lits = ann_lits or val_lits
         scope[var_name] = _LocalVarBinding(
             literals=lits,
             is_non_none=ann_non_none or val_non_none,
@@ -1595,7 +1647,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         method_name: str,
     ) -> FunctionInfo | None:
         """Look up `class_ref.method_name` directly or on indexed ancestor classes."""
-        cls_candidates = [f"{module_name}.{class_ref}"]
+        cls_candidates = [class_ref, f"{module_name}.{class_ref}"]
         imported = self.ctx.imports.get(class_ref)
         if imported is not None:
             cls_candidates.append(imported)
@@ -1710,17 +1762,9 @@ class _CallSiteCollector(cst.CSTVisitor):
             return self._classify_name_arg(expr.value, line)
 
         if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
-            enum_cls = self._resolve_in_scope_enum(expr.value.value)
-            if enum_cls is not None and expr.attr.value in enum_cls.enum_members:
-                return ObservedArg(
-                    file=self.ctx.file,
-                    line=line,
-                    is_test_caller=self.ctx.is_test_file,
-                    is_non_none=True,
-                    is_unknown=True,
-                    observed_type=enum_cls.name,
-                    enum_qualname=enum_cls.qualname,
-                )
+            enum_obs = self._classify_enum_attr_arg(expr, line)
+            if enum_obs is not None:
+                return enum_obs
 
         dict_keys = self._extract_const_str_dict_arg(expr) if isinstance(expr, cst.Dict) else None
 
@@ -1733,23 +1777,54 @@ class _CallSiteCollector(cst.CSTVisitor):
         ):
             inferred = expr.func.value
 
-        if is_definitely_non_none_expr(expr) or self._is_known_class_ctor_call(expr):
-            return ObservedArg(
-                file=self.ctx.file,
-                line=line,
-                is_test_caller=self.ctx.is_test_file,
-                is_non_none=True,
-                is_unknown=True,
-                observed_type=inferred,
-                dict_literal_keys=dict_keys,
-            )
+        if isinstance(expr, cst.Call) and inferred is None:
+            call_obs = self._classify_indexed_call_arg(expr, line)
+            if call_obs is not None:
+                return call_obs
 
+        is_non_none = is_definitely_non_none_expr(expr) or self._is_known_class_ctor_call(expr)
         return ObservedArg(
             file=self.ctx.file,
             line=line,
             is_test_caller=self.ctx.is_test_file,
+            is_non_none=is_non_none,
             is_unknown=True,
             observed_type=inferred,
+            dict_literal_keys=dict_keys if is_non_none else None,
+        )
+
+    def _classify_enum_attr_arg(self, expr: cst.Attribute, line: int) -> ObservedArg | None:
+        """Return an ObservedArg if `expr` is `EnumCls.MEMBER` for an in-scope StrEnum/IntEnum."""
+        if not isinstance(expr.value, cst.Name):
+            return None
+        enum_cls = self._resolve_in_scope_enum(expr.value.value)
+        if enum_cls is None or expr.attr.value not in enum_cls.enum_members:
+            return None
+        return ObservedArg(
+            file=self.ctx.file,
+            line=line,
+            is_test_caller=self.ctx.is_test_file,
+            is_non_none=True,
+            is_unknown=True,
+            observed_type=enum_cls.name,
+            enum_qualname=enum_cls.qualname,
+        )
+
+    def _classify_indexed_call_arg(self, expr: cst.Call, line: int) -> ObservedArg | None:
+        """Return an ObservedArg if `expr` calls an indexed function with a concrete return type."""
+        call_ret = self._infer_indexed_call_return(expr)
+        if call_ret is None:
+            return None
+        return ObservedArg(
+            file=self.ctx.file,
+            line=line,
+            is_test_caller=self.ctx.is_test_file,
+            is_none=call_ret.is_none,
+            is_non_none=call_ret.is_non_none,
+            literals=call_ret.literals,
+            is_unknown=call_ret.literals is None and not call_ret.is_none,
+            observed_type=call_ret.return_type,
+            enum_qualname=call_ret.enum_qualname,
         )
 
     def _classify_name_arg(self, name: str, line: int) -> ObservedArg:
@@ -1815,40 +1890,129 @@ class _CallSiteCollector(cst.CSTVisitor):
     def _infer_call_expr_type(self, expr: cst.BaseExpression) -> str | None:
         """Infer a conservative static type string for an argument or dict-value expression."""
         if isinstance(expr, (cst.List, cst.Set)) and expr.elements:
-            container = "list" if isinstance(expr, cst.List) else "set"
-            elem_types: set[str] = set()
-            homogeneous = True
-            for elem in expr.elements:
-                if isinstance(elem, cst.StarredElement):
-                    homogeneous = False
-                    break
-                inferred_el = self._infer_call_expr_type(elem.value)
-                if inferred_el is None or inferred_el in {
-                    "list",
-                    "dict",
-                    "set",
-                    "frozenset",
-                    "tuple",
-                }:
-                    homogeneous = False
-                    break
-                elem_types.add(inferred_el)
-            if homogeneous and len(elem_types) == 1:
-                return f"{container}[{next(iter(elem_types))}]"
+            seq_type = self._infer_homogeneous_call_seq(expr)
+            if seq_type is not None:
+                return seq_type
         simple = infer_simple_expr_type(expr)
         if simple is not None:
             return simple
         if isinstance(expr, cst.Name):
             binding = self._lookup_local_var(expr.value)
-            if binding is not None and binding.inferred_type is not None:
-                return binding.inferred_type
-        if (
-            self._is_known_class_ctor_call(expr)
-            and isinstance(expr, cst.Call)
-            and isinstance(expr.func, cst.Name)
-        ):
-            return expr.func.value
+            return binding.inferred_type if binding is not None else None
+        if isinstance(expr, cst.Call):
+            if self._is_known_class_ctor_call(expr) and isinstance(expr.func, cst.Name):
+                return expr.func.value
+            call_ret = self._infer_indexed_call_return(expr)
+            return call_ret.return_type if call_ret is not None else None
         return None
+
+    def _infer_homogeneous_call_seq(self, expr: cst.List | cst.Set) -> str | None:
+        """Return `list[T]` / `set[T]` if every element shares one concrete inferred type."""
+        container = "list" if isinstance(expr, cst.List) else "set"
+        elem_types: set[str] = set()
+        for elem in expr.elements:
+            if isinstance(elem, cst.StarredElement):
+                return None
+            inferred_el = self._infer_call_expr_type(elem.value)
+            if inferred_el is None or inferred_el in {"list", "dict", "set", "frozenset", "tuple"}:
+                return None
+            elem_types.add(inferred_el)
+        return f"{container}[{next(iter(elem_types))}]" if len(elem_types) == 1 else None
+
+    def _infer_indexed_call_return(self, call: cst.Call) -> _CalleeReturnInfo | None:
+        """Resolve return-type facts when `call` targets an indexed function/method."""
+        callee, _is_bound = self._resolve_call_target(call.func)
+        if callee is None:
+            return None
+        if callee.name == "__init__" and callee.class_name is not None:
+            cls_qual = f"{callee.module_name}.{callee.class_name}"
+            return _CalleeReturnInfo(
+                return_type=callee.class_name,
+                is_non_none=True,
+                is_none=False,
+                literals=None,
+                class_type=cls_qual,
+                enum_qualname=None,
+            )
+        return self._build_callee_return_info(callee)
+
+    def _build_callee_return_info(self, callee: FunctionInfo) -> _CalleeReturnInfo | None:
+        """Extract return-type facts from `callee.return_annotation_str`."""
+        ret_str = callee.return_annotation_str
+        if ret_str is None:
+            return None
+        stripped = ret_str.strip()
+        if stripped in {"Any", "typing.Any", "object", "builtins.object"}:
+            return None
+        if stripped == "None":
+            return _CalleeReturnInfo(
+                return_type="None",
+                is_non_none=False,
+                is_none=True,
+                literals=None,
+                class_type=None,
+                enum_qualname=None,
+            )
+
+        ann = _parse_annotation_str(stripped)
+        lits = extract_literal_values_from_annotation(ann)
+        if lits is not None:
+            return _CalleeReturnInfo(
+                return_type=stripped,
+                is_non_none=True,
+                is_none=False,
+                literals=lits,
+                class_type=None,
+                enum_qualname=None,
+            )
+
+        if not self._is_concrete_return_type(stripped, callee):
+            return None
+        class_ref = _extract_class_ref(ann)
+        resolved_cls = (
+            self._lookup_class_in_module(class_ref, callee.module_name)
+            if class_ref is not None
+            else None
+        )
+        resolved_class_type = resolved_cls.qualname if resolved_cls is not None else class_ref
+        enum_qual = (
+            resolved_cls.qualname
+            if (resolved_cls is not None and resolved_cls.enum_kind is not None)
+            else None
+        )
+        return _CalleeReturnInfo(
+            return_type=stripped,
+            is_non_none=callee.return_optional_inner is None,
+            is_none=False,
+            literals=None,
+            class_type=resolved_class_type,
+            enum_qualname=enum_qual,
+        )
+
+    def _is_concrete_return_type(self, ret_str: str, callee: FunctionInfo) -> bool:
+        """Return True if every top-level union member is a known builtin or indexed class (not a TypeVar)."""
+        ann = _parse_annotation_str(ret_str)
+        members = extract_union_members(ann) if ann is not None else None
+        parts = members if members is not None else (ret_str,)
+        for part in parts:
+            base = part.strip().strip("'\"").split("[", maxsplit=1)[0].strip()
+            short = base.rsplit(".", maxsplit=1)[-1]
+            if short in _KNOWN_CONCRETE_RETURN_BASES:
+                continue
+            if self._lookup_class_in_module(short, callee.module_name) is not None:
+                continue
+            if short in self._classes_by_short_name:
+                continue
+            return False
+        return True
+
+    def _lookup_class_in_module(self, class_name: str, module_name: str) -> ClassInfo | None:
+        """Look up `class_name` defined in or imported into `module_name`."""
+        direct = self.index.classes.get(f"{module_name}.{class_name}")
+        if direct is not None:
+            return direct
+        imported_qual = self.index.module_imports.get(module_name, {}).get(class_name)
+        return self.index.classes.get(imported_qual) if imported_qual is not None else None
 
     def _resolve_in_scope_enum(self, cls_name: str) -> ClassInfo | None:
         """Resolve a class name in the caller's module to an indexed StrEnum/IntEnum ClassInfo."""
@@ -1950,6 +2114,14 @@ def _collect_init_self_attr_types(init_fn: cst.FunctionDef, out: dict[str, str])
                 and small.value.value in param_types
             ):
                 out.setdefault(small.targets[0].target.attr.value, param_types[small.value.value])
+
+
+def _parse_annotation_str(annotation_str: str) -> cst.Annotation | None:
+    """Parse a type annotation string into a `cst.Annotation`, or None on syntax error."""
+    try:
+        return cst.Annotation(annotation=cst.parse_expression(annotation_str))
+    except cst.ParserSyntaxError:
+        return None
 
 
 def _extract_class_ref(annotation: cst.Annotation | None) -> str | None:
