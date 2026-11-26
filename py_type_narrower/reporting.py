@@ -105,9 +105,10 @@ def _format_candidate_text(
     """Render a single NarrowingCandidate as one or more terminal lines."""
     rel_file = _relative_display(cand.file, root)
     verify_tag = _verification_badge(cand.verification)
+    advisory_tag = "" if cand.is_fixable else " advisory"
     header = (
         f"{rel_file}:{cand.line}:{cand.col}: {cand.code.value} "
-        f"[T{cand.tier.value} score={cand.score}{verify_tag}] {cand.message}"
+        f"[T{cand.tier.value} score={cand.score}{verify_tag}{advisory_tag}] {cand.message}"
     )
     lines = [header]
     if verbose:
@@ -154,6 +155,7 @@ def _candidate_to_dict(cand: NarrowingCandidate, root: Path) -> dict[str, object
         "score": cand.score,
         "is_public": cand.is_public,
         "is_single_constant": cand.is_single_constant,
+        "is_fixable": cand.is_fixable,
         "verification": cand.verification.value,
         "message": cand.message,
         "evidence": [{"kind": e.kind, "detail": e.detail} for e in cand.evidence],
@@ -163,11 +165,16 @@ def _candidate_to_dict(cand: NarrowingCandidate, root: Path) -> dict[str, object
 
 def _candidate_to_sarif(cand: NarrowingCandidate, root: Path) -> dict[str, object]:
     """Convert a NarrowingCandidate to a SARIF result object."""
-    level = "warning" if cand.tier == 1 else "note"
+    level = "warning" if (cand.tier == 1 and cand.is_fixable) else "note"
     return {
         "ruleId": cand.code.value,
         "level": level,
         "message": {"text": cand.message},
+        "properties": {
+            "fixable": cand.is_fixable,
+            "score": cand.score,
+            "tier": cand.tier.value,
+        },
         "locations": [
             {
                 "physicalLocation": {

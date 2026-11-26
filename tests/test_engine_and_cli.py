@@ -200,3 +200,32 @@ def run() -> None:
     assert nt201[0].suggested_type == 'Literal["fast", "safe"]'
     # ...and prevent a false NT202 for `label` because caller.py passes None!
     assert not [c for c in result.candidates if c.code == RuleCode.NT202]
+
+
+def test_reporting_exposes_advisory_is_fixable_flag(tmp_path: Path, capsys) -> None:
+    mod = tmp_path / "advisory.py"
+    mod.write_text(
+        """from typing import Any
+
+def build_cfg() -> dict[str, Any]:
+    return {"host": "localhost", "port": 8080}
+""",
+        encoding="utf-8",
+    )
+
+    rc_text = main(["check", str(mod), "--tier", "1"])
+    text_out = capsys.readouterr().out
+    assert rc_text == 1
+    assert "advisory]" in text_out
+
+    rc_json = main(["check", str(mod), "--tier", "1", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc_json == 1
+    assert payload["candidates"][0]["is_fixable"] is False
+
+    rc_sarif = main(["check", str(mod), "--tier", "1", "--format", "sarif"])
+    sarif = json.loads(capsys.readouterr().out)
+    assert rc_sarif == 1
+    res = sarif["runs"][0]["results"][0]
+    assert res["level"] == "note"
+    assert res["properties"]["fixable"] is False
