@@ -114,6 +114,11 @@ def score_tier1_fixed_tuple_return(*, is_private: bool) -> int:
     return 92 if is_private else 88
 
 
+def score_tier1_container_non_none(*, is_private: bool) -> int:
+    """Score NT107 container/generator non-None element narrowing."""
+    return 92 if is_private else 88
+
+
 def score_tier2_callsite_literal(ctx: CallSiteScoreContext) -> tuple[int, list[str]]:
     """Compute a 0-100 confidence score and explanation notes for NT201 / NT203 literals."""
     score = 55

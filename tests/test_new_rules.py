@@ -347,3 +347,54 @@ def empty() -> tuple[int, ...]:
     assert "def coords(x: int, y: int) -> tuple[int, int]:" in rewritten
     assert "def labeled(flag: bool) -> tuple[str, int]:" in rewritten
     assert "def pair_any() -> tuple[str, int]:" in rewritten
+
+
+def test_nt107_container_and_generator_non_none_returns(tmp_path: Path) -> None:
+    code = """from collections.abc import Generator, Iterator
+
+def gen_ints(n: int) -> Iterator[int | None]:
+    for i in range(n):
+        yield i + 1
+
+def gen_with_send() -> Generator[str | None, None, None]:
+    yield "ok"
+
+def gen_yields_none(flag: bool) -> Iterator[int | None]:
+    if flag:
+        yield None
+    yield 1
+
+def gen_yield_from(xs: list[int | None]) -> Iterator[int | None]:
+    yield from xs
+
+def filtered_list(xs: list[str | None]) -> list[str | None]:
+    return [x for x in xs if x is not None]
+
+def list_with_none(flag: bool) -> list[int | None]:
+    return [1, None] if flag else [2]
+
+def dict_non_none(flag: bool) -> dict[str, int | None]:
+    if flag:
+        return {"a": 1, "b": 2}
+    return {}
+
+def empty_only() -> list[int | None]:
+    return []
+"""
+    mod = tmp_path / "containers.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands = run_rules(index, NarrowerConfig(max_tier=1))
+    nt107 = {c.symbol.rsplit(".", maxsplit=1)[-1]: c for c in cands if c.code == RuleCode.NT107}
+
+    assert set(nt107.keys()) == {"gen_ints", "gen_with_send", "filtered_list", "dict_non_none"}
+    assert nt107["gen_ints"].suggested_type == "Iterator[int]"
+    assert nt107["gen_with_send"].suggested_type == "Generator[str, None, None]"
+    assert nt107["filtered_list"].suggested_type == "list[str]"
+    assert nt107["dict_non_none"].suggested_type == "dict[str, int]"
+
+    rewritten = rewrite_module_source(code, list(nt107.values()))
+    assert "def gen_ints(n: int) -> Iterator[int]:" in rewritten
+    assert "def gen_with_send() -> Generator[str, None, None]:" in rewritten
+    assert "def filtered_list(xs: list[str | None]) -> list[str]:" in rewritten
+    assert "def dict_non_none(flag: bool) -> dict[str, int]:" in rewritten

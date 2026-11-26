@@ -36,6 +36,12 @@ class ReturnSummary:
     fixed_tuple_len: int | None = None
     fixed_tuple_slot_types: list[set[str]] = field(default_factory=list)
     fixed_tuple_slot_unknown: list[bool] = field(default_factory=list)
+    has_yields: bool = False
+    all_yields_non_none: bool = True
+    all_returns_non_none_seq: bool = True
+    has_non_empty_seq_element: bool = False
+    all_returns_non_none_dict: bool = True
+    has_non_empty_dict_entry: bool = False
 
 
 @dataclass
@@ -383,6 +389,12 @@ class _ReturnCollector(cst.CSTVisitor):
         self.fixed_tuple_len: int | None = None
         self.fixed_tuple_slot_types: list[set[str]] = []
         self.fixed_tuple_slot_unknown: list[bool] = []
+        self.has_yields = False
+        self.all_yields_non_none = True
+        self.all_returns_non_none_seq = True
+        self.has_non_empty_seq_element = False
+        self.all_returns_non_none_dict = True
+        self.has_non_empty_dict_entry = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: ARG002, N802
         return False
@@ -390,8 +402,14 @@ class _ReturnCollector(cst.CSTVisitor):
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: ARG002, N802
         return False
 
-    def visit_Yield(self, node: cst.Yield) -> bool:  # noqa: ARG002, N802
+    def visit_Yield(self, node: cst.Yield) -> bool:  # noqa: N802
         self.is_generator = True
+        self.has_yields = True
+        if node.value is None or isinstance(node.value, cst.From):
+            self.all_yields_non_none = False
+            return False
+        if not _expr_is_non_none_in_scope(node.value, self.local_non_none, self.known_class_names):
+            self.all_yields_non_none = False
         return False
 
     def visit_Return(self, node: cst.Return) -> bool:  # noqa: N802
@@ -401,6 +419,8 @@ class _ReturnCollector(cst.CSTVisitor):
             self.all_returns_non_none = False
             self.has_non_literal_return = True
             self.all_returns_fixed_tuple = False
+            self.all_returns_non_none_seq = False
+            self.all_returns_non_none_dict = False
             self.returned_types.add("None")
             return False
 
@@ -414,6 +434,8 @@ class _ReturnCollector(cst.CSTVisitor):
             self.returned_types.update(inferred)
 
         self._record_fixed_tuple(node.value)
+        self._record_non_none_seq(node.value)
+        self._record_non_none_dict(node.value)
 
         lit = extract_literal(node.value)
         if lit is not None:
@@ -421,6 +443,58 @@ class _ReturnCollector(cst.CSTVisitor):
         else:
             self.has_non_literal_return = True
         return False
+
+    def _record_non_none_seq(self, expr: cst.BaseExpression) -> None:
+        """Track whether every return is a sequence/set/tuple literal/comp with non-None items."""
+        if not self.all_returns_non_none_seq:
+            return
+        if isinstance(expr, cst.IfExp):
+            self._record_non_none_seq(expr.body)
+            self._record_non_none_seq(expr.orelse)
+            return
+        if isinstance(expr, (cst.List, cst.Set, cst.Tuple)):
+            for elem in expr.elements:
+                if isinstance(elem, cst.StarredElement) or not _expr_is_non_none_in_scope(
+                    elem.value, self.local_non_none, self.known_class_names
+                ):
+                    self.all_returns_non_none_seq = False
+                    return
+                self.has_non_empty_seq_element = True
+            return
+        if isinstance(expr, (cst.ListComp, cst.SetComp)):
+            extra_non_none = _comp_non_none_targets(expr.for_in)
+            if _expr_is_non_none_in_scope(
+                expr.elt, self.local_non_none | extra_non_none, self.known_class_names
+            ):
+                self.has_non_empty_seq_element = True
+                return
+        self.all_returns_non_none_seq = False
+
+    def _record_non_none_dict(self, expr: cst.BaseExpression) -> None:
+        """Track whether every return is a dict literal/comp with non-None values."""
+        if not self.all_returns_non_none_dict:
+            return
+        if isinstance(expr, cst.IfExp):
+            self._record_non_none_dict(expr.body)
+            self._record_non_none_dict(expr.orelse)
+            return
+        if isinstance(expr, cst.Dict):
+            for elem in expr.elements:
+                if not isinstance(elem, cst.DictElement) or not _expr_is_non_none_in_scope(
+                    elem.value, self.local_non_none, self.known_class_names
+                ):
+                    self.all_returns_non_none_dict = False
+                    return
+                self.has_non_empty_dict_entry = True
+            return
+        if isinstance(expr, cst.DictComp):
+            extra_non_none = _comp_non_none_targets(expr.for_in)
+            if _expr_is_non_none_in_scope(
+                expr.value, self.local_non_none | extra_non_none, self.known_class_names
+            ):
+                self.has_non_empty_dict_entry = True
+                return
+        self.all_returns_non_none_dict = False
 
     def _record_fixed_tuple(self, expr: cst.BaseExpression) -> None:
         """Track fixed-length tuple literal returns and per-slot inferred types."""
@@ -489,8 +563,41 @@ def _analyze_returns(
     summary.fixed_tuple_len = collector.fixed_tuple_len
     summary.fixed_tuple_slot_types = collector.fixed_tuple_slot_types
     summary.fixed_tuple_slot_unknown = collector.fixed_tuple_slot_unknown
+    summary.has_yields = collector.has_yields
+    summary.all_yields_non_none = collector.all_yields_non_none
+    summary.all_returns_non_none_seq = collector.all_returns_non_none_seq
+    summary.has_non_empty_seq_element = collector.has_non_empty_seq_element
+    summary.all_returns_non_none_dict = collector.all_returns_non_none_dict
+    summary.has_non_empty_dict_entry = collector.has_non_empty_dict_entry
     summary.can_fallthrough = not _block_always_terminates(stmts)
     return summary
+
+
+def _comp_non_none_targets(for_in: cst.CompFor) -> set[str]:
+    """Extract variable names guarded by `x is not None` inside comprehension `if` clauses."""
+    guarded: set[str] = set()
+    curr: cst.CompFor | None = for_in
+    while curr is not None:
+        for comp_if in curr.ifs:
+            name = _extract_is_not_none_name(comp_if.test)
+            if name is not None:
+                guarded.add(name)
+        curr = curr.inner_for_in
+    return guarded
+
+
+def _extract_is_not_none_name(test: cst.BaseExpression) -> str | None:
+    """Return `x` if test is `x is not None` or `None is not x`."""
+    if not isinstance(test, cst.Comparison) or len(test.comparisons) != 1:
+        return None
+    comp = test.comparisons[0]
+    if not isinstance(comp.operator, cst.IsNot):
+        return None
+    if isinstance(test.left, cst.Name) and is_none_expr(comp.comparator):
+        return test.left.value
+    if is_none_expr(test.left) and isinstance(comp.comparator, cst.Name):
+        return comp.comparator.value
+    return None
 
 
 class _LocalTypeVisitor(cst.CSTVisitor):

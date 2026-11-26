@@ -79,18 +79,6 @@ def is_int_annotation(annotation: cst.Annotation | None) -> bool:
     return _annotation_simple_name(annotation.annotation) in {"int", "builtins.int"}
 
 
-def extract_optional_inner(annotation: cst.Annotation | None) -> str | None:
-    """If annotation is Optional[T] or a Union containing None, return the non-None type string."""
-    if annotation is None:
-        return None
-    expr = annotation.annotation
-    if isinstance(expr, cst.BinaryOperation) and isinstance(expr.operator, cst.BitOr):
-        return _strip_none_from_bitor_union(expr)
-    if isinstance(expr, cst.Subscript):
-        return _strip_none_from_subscript_union(expr)
-    return None
-
-
 def format_union_type(members: Sequence[str]) -> str:
     """Format one or more union member strings using PEP 604 `|` syntax."""
     return " | ".join(members)
@@ -200,6 +188,154 @@ def _matches_numeric_tower(
 
 
 _MIN_UNION_MEMBERS = 2
+
+
+@dataclass(frozen=True)
+class ContainerOptionalSpec:
+    """Parsed container or generator return annotation whose element/value/yield is Optional."""
+
+    kind: TypingLiteral["seq", "dict", "generator", "iterable"]
+    narrowed_annotation: str
+
+
+_SEQ_CONTAINER_NAMES: frozenset[str] = frozenset(
+    {
+        "list",
+        "builtins.list",
+        "List",
+        "typing.List",
+        "Sequence",
+        "typing.Sequence",
+        "collections.abc.Sequence",
+        "MutableSequence",
+        "typing.MutableSequence",
+        "collections.abc.MutableSequence",
+        "Collection",
+        "typing.Collection",
+        "collections.abc.Collection",
+        "set",
+        "builtins.set",
+        "Set",
+        "typing.Set",
+        "AbstractSet",
+        "typing.AbstractSet",
+        "collections.abc.Set",
+        "frozenset",
+        "builtins.frozenset",
+        "FrozenSet",
+        "typing.FrozenSet",
+    }
+)
+_DICT_CONTAINER_NAMES: frozenset[str] = frozenset(
+    {
+        "dict",
+        "builtins.dict",
+        "Dict",
+        "typing.Dict",
+        "Mapping",
+        "typing.Mapping",
+        "collections.abc.Mapping",
+        "MutableMapping",
+        "typing.MutableMapping",
+        "collections.abc.MutableMapping",
+    }
+)
+_GENERATOR_ONLY_NAMES: frozenset[str] = frozenset(
+    {
+        "Iterator",
+        "typing.Iterator",
+        "collections.abc.Iterator",
+        "AsyncIterator",
+        "typing.AsyncIterator",
+        "collections.abc.AsyncIterator",
+        "Generator",
+        "typing.Generator",
+        "collections.abc.Generator",
+        "AsyncGenerator",
+        "typing.AsyncGenerator",
+        "collections.abc.AsyncGenerator",
+    }
+)
+_ITERABLE_NAMES: frozenset[str] = frozenset(
+    {
+        "Iterable",
+        "typing.Iterable",
+        "collections.abc.Iterable",
+        "AsyncIterable",
+        "typing.AsyncIterable",
+        "collections.abc.AsyncIterable",
+    }
+)
+
+
+def extract_optional_container_return(annotation_str: str | None) -> ContainerOptionalSpec | None:
+    """If annotation is a container/generator with an Optional element/value/yield, return spec."""
+    expr = _parse_subscript_annotation(annotation_str)
+    if expr is None:
+        return None
+    base_name = _annotation_simple_name(expr.value)
+    if base_name is None:
+        return None
+    outer = expr_to_code(expr.value)
+    args = _extract_subscript_index_args(expr)
+    if args is None:
+        return None
+    return _build_optional_container_spec(base_name, outer, args)
+
+
+def _extract_subscript_index_args(expr: cst.Subscript) -> list[cst.BaseExpression] | None:
+    """Return index expressions of a subscript if every slice is a plain cst.Index."""
+    args: list[cst.BaseExpression] = []
+    for elem in expr.slice:
+        if not isinstance(elem.slice, cst.Index):
+            return None
+        args.append(elem.slice.value)
+    return args or None
+
+
+def _build_optional_container_spec(
+    base_name: str,
+    outer: str,
+    args: list[cst.BaseExpression],
+) -> ContainerOptionalSpec | None:
+    """Classify a subscripted container/generator annotation and strip Optional from its payload."""
+    if base_name in _SEQ_CONTAINER_NAMES and len(args) == 1:
+        inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
+        return ContainerOptionalSpec("seq", f"{outer}[{inner}]") if inner else None
+    if (
+        base_name in {"tuple", "builtins.tuple", "Tuple", "typing.Tuple"}
+        and len(args) == _MIN_UNION_MEMBERS
+        and isinstance(args[1], cst.Ellipsis)
+    ):
+        inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
+        return ContainerOptionalSpec("seq", f"{outer}[{inner}, ...]") if inner else None
+    if base_name in _DICT_CONTAINER_NAMES and len(args) == _MIN_UNION_MEMBERS:
+        inner = extract_optional_inner(cst.Annotation(annotation=args[1]))
+        if inner:
+            return ContainerOptionalSpec("dict", f"{outer}[{expr_to_code(args[0])}, {inner}]")
+        return None
+    if base_name in _GENERATOR_ONLY_NAMES or base_name in _ITERABLE_NAMES:
+        inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
+        if inner:
+            rest = [expr_to_code(a) for a in args[1:]]
+            joined = ", ".join([inner, *rest])
+            kind: TypingLiteral["generator", "iterable"] = (
+                "iterable" if base_name in _ITERABLE_NAMES else "generator"
+            )
+            return ContainerOptionalSpec(kind, f"{outer}[{joined}]")
+    return None
+
+
+def extract_optional_inner(annotation: cst.Annotation | None) -> str | None:
+    """If annotation is Optional[T] or a Union containing None, return the non-None type string."""
+    if annotation is None:
+        return None
+    expr = annotation.annotation
+    if isinstance(expr, cst.BinaryOperation) and isinstance(expr.operator, cst.BitOr):
+        return _strip_none_from_bitor_union(expr)
+    if isinstance(expr, cst.Subscript):
+        return _strip_none_from_subscript_union(expr)
+    return None
 
 
 def extract_variadic_tuple_element(annotation_str: str | None) -> tuple[str, str] | None:

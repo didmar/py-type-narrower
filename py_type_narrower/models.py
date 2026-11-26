@@ -26,6 +26,7 @@ class RuleCode(StrEnum):
     NT104 = "NT104"  # Tier 1: Always-initialized class attribute T | None -> T
     NT105 = "NT105"  # Tier 1: Return union A | B | C has unused branch(es)
     NT106 = "NT106"  # Tier 1: Variadic tuple[T, ...] return -> fixed-length tuple[T1, T2]
+    NT107 = "NT107"  # Tier 1: Container/generator element T | None never contains/yields None
     NT201 = "NT201"  # Tier 2: Call-site str/int parameter -> Literal[...]
     NT202 = "NT202"  # Tier 2: Call-site T | None parameter -> T
     NT203 = "NT203"  # Tier 2: Dataclass / NamedTuple field narrowing across call sites

@@ -10,6 +10,7 @@ import libcst as cst
 from py_type_narrower.body_analysis import filter_literals_by_kind
 from py_type_narrower.cst_utils import (
     ExtractedLiteral,
+    extract_optional_container_return,
     extract_union_members,
     extract_variadic_tuple_element,
     format_literal_type,
@@ -29,6 +30,7 @@ from py_type_narrower.scorer import (
     ConstantBoolScoreContext,
     OptionalParamScoreContext,
     score_tier1_always_initialized_attr,
+    score_tier1_container_non_none,
     score_tier1_fixed_tuple_return,
     score_tier1_guarded_param,
     score_tier1_literal_return,
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from py_type_narrower.body_analysis import ReturnSummary
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
         ClassInfo,
@@ -171,6 +174,7 @@ def _run_tier1_function_rules(
         (RuleCode.NT102, _rule_nt102_unused_optional_return),
         (RuleCode.NT103, _rule_nt103_literal_return),
         (RuleCode.NT106, _rule_nt106_fixed_tuple_return),
+        (RuleCode.NT107, _rule_nt107_container_non_none_return),
     )
     seen_targets: set[tuple[TargetKind, str | None]] = set()
     for code, rule_fn in rules:
@@ -596,6 +600,76 @@ def _parse_union_members(type_str: str) -> tuple[str, ...] | None:
     except cst.ParserSyntaxError:
         return None
     return extract_union_members(cst.Annotation(annotation=expr))
+
+
+def _rule_nt107_container_non_none_return(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+) -> list[NarrowingCandidate]:
+    """NT107: Container/generator return `list[T | None]` / `Iterator[T | None]` never yields None."""
+    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, config):
+        return []
+    spec = extract_optional_container_return(func.return_annotation_str)
+    if spec is None:
+        return []
+    ret = func.body_facts.returns
+    if ret.is_stub:
+        return []
+
+    detail = _match_container_non_none_detail(spec.kind, ret)
+    if detail is None:
+        return []
+
+    return [
+        NarrowingCandidate(
+            code=RuleCode.NT107,
+            tier=Tier.LOCAL,
+            file=func.file,
+            line=func.return_line,
+            col=func.return_col,
+            symbol=func.qualname,
+            target_kind=TargetKind.RETURN,
+            target_name=None,
+            current_type=func.return_annotation_str,
+            suggested_type=spec.narrowed_annotation,
+            needs_literal_import=False,
+            message=(
+                f"Return type of `{func.name}` is `{func.return_annotation_str}`, "
+                f"but {detail}; narrow to `{spec.narrowed_annotation}`"
+            ),
+            evidence=[
+                EvidenceItem(
+                    kind="container_non_none",
+                    detail=detail,
+                    file=func.file,
+                    line=func.line,
+                )
+            ],
+            score=score_tier1_container_non_none(is_private=func.is_private),
+            is_public=not func.is_private,
+        )
+    ]
+
+
+def _match_container_non_none_detail(kind: str, ret: ReturnSummary) -> str | None:
+    """Return an evidence detail string if ReturnSummary proves no None element/yield."""
+    if kind in {"generator", "iterable"} and ret.is_generator:
+        return (
+            "every `yield` expression is provably non-None"
+            if (ret.has_yields and ret.all_yields_non_none)
+            else None
+        )
+    if ret.is_generator or not ret.has_returns or ret.can_fallthrough:
+        return None
+    if (
+        kind in {"seq", "iterable"}
+        and ret.all_returns_non_none_seq
+        and ret.has_non_empty_seq_element
+    ):
+        return "every returned element is provably non-None"
+    if kind == "dict" and ret.all_returns_non_none_dict and ret.has_non_empty_dict_entry:
+        return "every returned dictionary value is provably non-None"
+    return None
 
 
 def _rule_nt201_callsite_literal(
