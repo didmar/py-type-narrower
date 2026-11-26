@@ -10,6 +10,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+class Tier(IntEnum):
+    """Confidence tier of a narrowing rule."""
+
+    LOCAL = 1
+    WHOLE_REPO = 2
+
+
 class RuleCode(StrEnum):
     """Identifiers for type-narrowing rules."""
 
@@ -24,12 +31,10 @@ class RuleCode(StrEnum):
     NT204 = "NT204"  # Tier 2: Call-site union parameter A | B | C has unused branch(es)
     NT205 = "NT205"  # Tier 2: Constant bool parameter -> Literal[True] / Literal[False]
 
-
-class Tier(IntEnum):
-    """Confidence tier of a narrowing rule."""
-
-    LOCAL = 1
-    WHOLE_REPO = 2
+    @property
+    def tier(self) -> Tier:
+        """Return the confidence tier associated with this rule code."""
+        return Tier.LOCAL if self.value.startswith("NT1") else Tier.WHOLE_REPO
 
 
 class TargetKind(StrEnum):

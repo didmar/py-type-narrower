@@ -39,6 +39,7 @@ from py_type_narrower.scorer import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from py_type_narrower.config import NarrowerConfig
     from py_type_narrower.indexer import (
@@ -95,17 +96,31 @@ DATA_MODEL_DUNDER_METHODS: frozenset[str] = frozenset(
 MODULE_DUNDER_FUNCTIONS: frozenset[str] = frozenset({"__getattr__", "__dir__"})
 
 
-def run_rules(index: CodebaseIndex, config: NarrowerConfig) -> list[NarrowingCandidate]:
-    """Evaluate all enabled narrowing rules against a CodebaseIndex."""
+def run_rules(
+    index: CodebaseIndex,
+    config: NarrowerConfig,
+    *,
+    target_files: set[Path] | None = None,
+) -> list[NarrowingCandidate]:
+    """Evaluate all enabled narrowing rules against a CodebaseIndex.
+
+    When `target_files` is provided, only definitions inside those files are reported,
+    while the full index still supplies cross-file call sites and class hierarchies.
+    """
     active = config.active_rules()
+    resolved_targets = {p.resolve() for p in target_files} if target_files is not None else None
     candidates: list[NarrowingCandidate] = []
 
     for func in sorted(index.functions.values(), key=lambda f: (str(f.file), f.line, f.col)):
+        if resolved_targets is not None and func.file.resolve() not in resolved_targets:
+            continue
         if func.is_test_file and not config.include_test_files:
             continue
         _evaluate_function_rules(func, index, config, active, candidates)
 
     for cls in sorted(index.classes.values(), key=lambda c: (str(c.file), c.line, c.col)):
+        if resolved_targets is not None and cls.file.resolve() not in resolved_targets:
+            continue
         if cls.is_test_file and not config.include_test_files:
             continue
         _evaluate_class_rules(cls, index, config, active, candidates)

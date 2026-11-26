@@ -43,10 +43,12 @@ def analyze_paths(
 ) -> AnalysisResult:
     """Run single- or multi-pass narrowing analysis, optional verification, and optional fixing."""
     opts = options or RunOptions()
-    files = discover_python_files(paths, config.exclude)
-    if not files:
+    target_files = discover_python_files(paths, config.exclude)
+    if not target_files:
         return AnalysisResult()
 
+    indexed_files = _resolve_index_files(target_files, project_root, config)
+    target_set = set(target_files)
     resolved_adapter = _get_verifier_adapter(config, project_root, opts.adapter)
     original_sources: dict[Path, str] = {}
     working_sources: dict[Path, str] = {}
@@ -57,12 +59,12 @@ def analyze_paths(
 
     for pass_num in range(1, max(1, config.max_passes) + 1):
         passes_run = pass_num
-        index = index_files(files, project_root, overrides=working_sources or None)
+        index = index_files(indexed_files, project_root, overrides=working_sources or None)
         if pass_num == 1:
             original_sources = dict(index.files)
             working_sources = dict(index.files)
 
-        pass_candidates = run_rules(index, config)
+        pass_candidates = run_rules(index, config, target_files=target_set)
         if not pass_candidates:
             break
 
@@ -105,6 +107,21 @@ def analyze_paths(
         passes_run=passes_run,
         verifier_used=resolved_adapter.name if resolved_adapter is not None else None,
     )
+
+
+def _resolve_index_files(
+    target_files: list[Path],
+    project_root: Path,
+    config: NarrowerConfig,
+) -> list[Path]:
+    """Return files to index: full project_root when Tier 2 rules are active, else target_files."""
+    has_tier2 = config.max_tier >= Tier.WHOLE_REPO and any(
+        rule.tier == Tier.WHOLE_REPO for rule in config.active_rules()
+    )
+    if not has_tier2:
+        return target_files
+    project_files = discover_python_files([project_root], config.exclude)
+    return sorted({*project_files, *target_files})
 
 
 def _get_verifier_adapter(

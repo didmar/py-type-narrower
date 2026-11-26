@@ -161,3 +161,42 @@ def test_flake8_plugin_reports_tier1_rules(tmp_path: Path) -> None:
     codes = {msg.split()[0] for _line, _col, msg, _cls in findings}
     assert codes == {"NT101", "NT103"}
     assert all(line == 1 and cls is TypeNarrowerChecker for line, _col, _msg, cls in findings)
+
+
+def test_tier2_indexes_project_root_while_reporting_only_target_paths(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_text(
+        """
+def render(mode: str, label: str | None = None) -> int:
+    return len(mode) + (len(label) if label else 0)
+""",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "caller.py"
+    caller.write_text(
+        """
+from target import render
+
+def _caller_only_issue(x: str) -> str | None:
+    return x
+
+def run() -> None:
+    render("fast", None)
+    render("safe", "ok")
+    render("fast", "ok")
+""",
+        encoding="utf-8",
+    )
+
+    cfg = NarrowerConfig(max_tier=2, closed_world=True)
+    result = analyze_paths([target], project_root=tmp_path, config=cfg)
+
+    # Only target.py candidates are reported (not caller.py's _caller_only_issue)
+    assert all(c.file.resolve() == target.resolve() for c in result.candidates)
+    # Cross-file callers in caller.py power NT201 for `mode`...
+    nt201 = [c for c in result.candidates if c.code == RuleCode.NT201]
+    assert len(nt201) == 1
+    assert nt201[0].target_name == "mode"
+    assert nt201[0].suggested_type == 'Literal["fast", "safe"]'
+    # ...and prevent a false NT202 for `label` because caller.py passes None!
+    assert not [c for c in result.candidates if c.code == RuleCode.NT202]
