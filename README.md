@@ -81,6 +81,7 @@ Other options:
 - `--unsafe-fixes` — Also apply Tier 2 fixes inferred from call sites across your codebase (`fix` only applies local Tier 1 fixes by default).
 - `--scaffold-typeddict` — Generate `TypedDict` classes for functions returning or accepting fixed-key `dict`s (otherwise reported as advisory suggestions).
 - `--changed` / `--diff-base main` — Only check or fix files modified in git or on the current branch, which is useful for gradual adoption or CI.
+- `--exclude` — Exclude directories, files, or glob patterns from indexing (repeatable). For example, pass `--exclude tests` if your test suite is not type-checked and you don't want test calls (such as `pytest.raises` error-path tests) to suppress narrowing.
 - `--format` — Output format for `check`: `text` (default), `json`, or `sarif` (for editors and GitHub Code Scanning).
 - `-v` / `--show-rejected` — Show why each narrowing was suggested, or why `--verify` rejected one.
 

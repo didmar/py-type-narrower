@@ -315,7 +315,13 @@ def _has_incompatible_nt101_caller(
     ctx: _RuleEvalContext,
     visiting: frozenset[tuple[str, str]] = frozenset(),
 ) -> bool:
-    """Return True if any indexed caller passes a non-literal or out-of-set argument to `param`."""
+    """Return True if any indexed caller passes a non-literal or out-of-set argument to `param`.
+
+    Intentionally includes callers from test files (`obs.is_test_caller`), consistent with
+    NT201-NT206: `is_test_path` is only a path heuristic and many repos type-check `tests/`,
+    so ignoring test callers would make Tier 1 auto-fixes unsound without `--verify`. Users
+    who do not type-check tests can exclude them via `--exclude tests`.
+    """
     stats = ctx.index.call_stats.get((func.qualname, param.name))
     if stats is None:
         return False
