@@ -11,7 +11,7 @@ from py_type_narrower.models import (
     VerificationStatus,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "AnalysisResult",

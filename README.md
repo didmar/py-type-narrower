@@ -166,7 +166,7 @@ Because `flake8` checks one file at a time (as does `py-type-narrower --tier 1` 
 ```yaml
 repos:
   - repo: https://github.com/didmar/py-type-narrower
-    rev: v0.1.0
+    rev: v0.1.1
     hooks:
       - id: py-type-narrower-check
         args: ["--tier", "1"]
