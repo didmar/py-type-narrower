@@ -13,7 +13,9 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, PositionProvider
 
 from py_type_narrower.body_analysis import (
+    BodyAnalysisContext,
     BodyFacts,
+    ReturnSummary,
     analyze_function_body,
     extract_module_const_dicts,
 )
@@ -25,9 +27,12 @@ from py_type_narrower.cst_utils import (
     extract_literal,
     extract_literal_values_from_annotation,
     extract_not_required_inner,
+    extract_optional_container_return,
     extract_optional_inner,
     extract_required_inner,
+    extract_str_key_dict_annotation,
     extract_union_members,
+    extract_variadic_tuple_element,
     infer_simple_expr_type,
     is_bool_annotation,
     is_definitely_non_none_expr,
@@ -716,24 +721,56 @@ class _DefinitionCollector(cst.CSTVisitor):
         )
 
         params = self._extract_params(node.params)
-        param_non_none = {
-            p.name
-            for p in params
-            if p.annotation_str is not None
-            and p.optional_inner is None
-            and p.annotation_str != "None"
-        }
-        param_types = {p.name: p.annotation_str for p in params if p.annotation_str is not None}
-        if self._class_attr_types_stack:
-            for attr_name, attr_type in self._class_attr_types_stack[-1].items():
-                param_types[f"self.{attr_name}"] = attr_type
-        body_facts = analyze_function_body(
-            node,
-            param_non_none_names=param_non_none,
-            module_const_dicts=self.const_dicts,
-            known_class_names=self.known_class_names,
-            param_types=param_types,
+        is_staticmethod = _has_decorator(node, {"staticmethod"})
+        return_annotation_str = (
+            expr_to_code(node.returns.annotation) if node.returns is not None else None
         )
+        return_primitive_kind = base_primitive_annotation(node.returns)
+        return_optional_inner = extract_optional_inner(node.returns)
+        return_union_members = extract_union_members(node.returns)
+
+        needs_return_analysis = _has_narrowable_return_annotation(
+            return_annotation_str,
+            return_primitive_kind,
+            return_optional_inner,
+            return_union_members,
+        )
+        non_receiver = params[1:] if (is_method and not is_staticmethod and params) else params
+        guard_param_names = {p.name for p in non_receiver if p.primitive_kind is not None}
+
+        if needs_return_analysis or guard_param_names:
+            param_non_none = (
+                {
+                    p.name
+                    for p in params
+                    if p.annotation_str is not None
+                    and p.optional_inner is None
+                    and p.annotation_str != "None"
+                }
+                if needs_return_analysis
+                else set()
+            )
+            param_types: dict[str, str] = {}
+            if needs_return_analysis:
+                param_types = {
+                    p.name: p.annotation_str for p in params if p.annotation_str is not None
+                }
+                if self._class_attr_types_stack:
+                    for attr_name, attr_type in self._class_attr_types_stack[-1].items():
+                        param_types[f"self.{attr_name}"] = attr_type
+            body_facts = analyze_function_body(
+                node,
+                BodyAnalysisContext(
+                    param_non_none_names=param_non_none,
+                    module_const_dicts=self.const_dicts,
+                    known_class_names=self.known_class_names,
+                    param_types=param_types,
+                    analyze_returns=needs_return_analysis,
+                    guard_param_names=guard_param_names,
+                ),
+            )
+        else:
+            body_facts = BodyFacts(returns=ReturnSummary())
 
         ret_pos = (
             self.get_metadata(PositionProvider, node.returns) if node.returns is not None else pos
@@ -751,7 +788,7 @@ class _DefinitionCollector(cst.CSTVisitor):
                 node.name.value, cls_name, self.exported_all, in_nested_function=False
             ),
             is_method=is_method,
-            is_staticmethod=_has_decorator(node, {"staticmethod"}),
+            is_staticmethod=is_staticmethod,
             is_classmethod=_has_decorator(node, {"classmethod"}),
             is_abstract=_has_decorator(node, {"abstractmethod"}),
             is_override=_has_decorator(node, {"override"}),
@@ -760,21 +797,37 @@ class _DefinitionCollector(cst.CSTVisitor):
             parameters=params,
             has_vararg=isinstance(node.params.star_arg, cst.Param),
             has_kwarg=node.params.star_kwarg is not None,
-            return_annotation_str=(
-                expr_to_code(node.returns.annotation) if node.returns is not None else None
-            ),
-            return_primitive_kind=base_primitive_annotation(node.returns),
-            return_optional_inner=extract_optional_inner(node.returns),
+            return_annotation_str=return_annotation_str,
+            return_primitive_kind=return_primitive_kind,
+            return_optional_inner=return_optional_inner,
             return_line=ret_pos.start.line,
             return_col=ret_pos.start.column,
             body_facts=body_facts,
-            return_union_members=extract_union_members(node.returns),
+            return_union_members=return_union_members,
         )
         self.index.functions[qualname] = info
         return True
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:  # noqa: ARG002, N802
         self._func_depth -= 1
+
+    def on_visit(self, node: cst.CSTNode) -> bool:
+        """Skip expressions and simple statements; only descend into definitions and blocks."""
+        if isinstance(
+            node,
+            (
+                cst.SimpleStatementLine,
+                cst.BaseExpression,
+                cst.Parameters,
+                cst.Decorator,
+                cst.Annotation,
+                cst.Arg,
+                cst.WithItem,
+                cst.MatchPattern,
+            ),
+        ):
+            return False
+        return super().on_visit(node)
 
     def _extract_params(self, params: cst.Parameters) -> list[ParamInfo]:
         """Extract ParamInfo records for posonly, regular, and kwonly parameters."""
@@ -815,6 +868,34 @@ class _DefinitionCollector(cst.CSTVisitor):
         return result
 
 
+_ANY_OR_OBJECT_ANNOTATIONS: frozenset[str] = frozenset(
+    {"Any", "typing.Any", "object", "builtins.object"}
+)
+
+
+def _has_narrowable_return_annotation(
+    return_annotation_str: str | None,
+    return_primitive_kind: TypingLiteral["str", "int"] | None,
+    return_optional_inner: str | None,
+    return_union_members: tuple[str, ...] | None,
+) -> bool:
+    """Return True if any return-narrowing rule (NT102-NT109) could apply to this annotation."""
+    if return_annotation_str is None:
+        return False
+    if (
+        return_optional_inner is not None
+        or return_primitive_kind is not None
+        or return_union_members is not None
+        or return_annotation_str.strip() in _ANY_OR_OBJECT_ANNOTATIONS
+    ):
+        return True
+    return (
+        extract_variadic_tuple_element(return_annotation_str) is not None
+        or extract_optional_container_return(return_annotation_str) is not None
+        or extract_str_key_dict_annotation(return_annotation_str) is not None
+    )
+
+
 def _index_module_definitions(
     path: Path,
     source: str,
@@ -833,7 +914,7 @@ def _index_module_definitions(
     index.files[resolved] = source
     index.ignores[resolved] = parse_file_ignores(source)
 
-    wrapper = MetadataWrapper(module)
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
     const_dicts = extract_module_const_dicts(module)
     exported_all = _extract_dunder_all(module)
     imports, module_imports = _extract_imports(module, module_name)

@@ -69,23 +69,42 @@ class BodyFacts:
     param_guards: dict[str, ParamGuardInfo] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class BodyAnalysisContext:
+    """Inputs controlling intra-procedural return and parameter-guard analysis."""
+
+    param_non_none_names: set[str]
+    module_const_dicts: dict[str, set[ExtractedLiteral]]
+    known_class_names: set[str]
+    param_types: dict[str, str] = field(default_factory=dict)
+    analyze_returns: bool = True
+    guard_param_names: set[str] | None = None
+
+
 def analyze_function_body(
     func: cst.FunctionDef,
-    param_non_none_names: set[str],
-    module_const_dicts: dict[str, set[ExtractedLiteral]],
-    known_class_names: set[str],
-    param_types: dict[str, str] | None = None,
+    ctx: BodyAnalysisContext,
 ) -> BodyFacts:
     """Analyze return paths and parameter literal guards for a function definition."""
     stmts = _extract_body_statements(func.body)
-    returns = _analyze_returns(
-        stmts,
-        param_non_none_names,
-        known_class_names,
-        param_types=param_types or {},
+    returns = (
+        _analyze_returns(
+            stmts,
+            ctx.param_non_none_names,
+            ctx.known_class_names,
+            param_types=ctx.param_types,
+        )
+        if ctx.analyze_returns
+        else ReturnSummary()
     )
-    param_names = _collect_param_names(func.params)
-    guards = _analyze_param_guards(stmts, param_names, module_const_dicts)
+    param_names = (
+        _collect_param_names(func.params)
+        if ctx.guard_param_names is None
+        else ctx.guard_param_names
+    )
+    guards = (
+        _analyze_param_guards(stmts, param_names, ctx.module_const_dicts) if param_names else {}
+    )
     return BodyFacts(returns=returns, param_guards=guards)
 
 
