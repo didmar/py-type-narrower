@@ -37,7 +37,7 @@ py-type-narrower = "py_type_narrower.cli:main"
 NT = "py_type_narrower.flake8_plugin:TypeNarrowerChecker"
 
 [project.optional-dependencies]
-flake8 = ["flake8>=7.0.0"]
+flake8 = ["flake8>=6.0"]
 
 [tool.ruff]
 line-length = 100
@@ -90,7 +90,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "flake8>=7.0.0",
+    "flake8>=6.0",
     "flake8-stepdown>=0.1.2; python_version >= '3.12'",
     "hypothesis>=6.170.17",
     "pytest>=8.3.0",
