@@ -83,6 +83,7 @@ class SweepOptions:
     clean: bool
     max_per_rule: int
     compare: Path | None
+    scaffold_typeddict: bool = False
 
 
 @dataclass
@@ -275,6 +276,11 @@ def _parse_args(argv: list[str] | None) -> SweepOptions:
         default=None,
         help="Compare this run against a previous results.json file",
     )
+    parser.add_argument(
+        "--scaffold-typeddict",
+        action="store_true",
+        help="Pass --scaffold-typeddict to py-type-narrower check",
+    )
 
     args = parser.parse_args(argv)
     repos = tuple(r.strip() for r in args.repos.split(",") if r.strip()) if args.repos else ()
@@ -296,6 +302,7 @@ def _parse_args(argv: list[str] | None) -> SweepOptions:
         clean=args.clean,
         max_per_rule=args.max_per_rule,
         compare=args.compare,
+        scaffold_typeddict=args.scaffold_typeddict,
     )
 
 
@@ -535,6 +542,8 @@ def _build_check_command(
         cmd.extend(["--select", opts.select])
     if opts.ignore is not None:
         cmd.extend(["--ignore", opts.ignore])
+    if opts.scaffold_typeddict:
+        cmd.append("--scaffold-typeddict")
     return cmd
 
 
