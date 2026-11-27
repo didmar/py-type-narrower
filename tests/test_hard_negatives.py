@@ -563,3 +563,116 @@ def callers() -> None:
         NarrowerConfig(max_tier=2, closed_world=True, ignore={RuleCode.NT101}),
     )
     assert [c for c in cands_no_nt101 if c.target_name == "mode"] == []
+
+
+def test_nt101_allows_self_recursion_and_narrowable_wrapper_chains(tmp_path: Path) -> None:
+    code = """def walk(mode: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    if n <= 0:
+        return 0
+    return walk(mode, n - 1)
+
+def walk_bad_lit(mode: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    if n <= 0:
+        return 0
+    return walk_bad_lit("invalid", n - 1)
+
+def walk_other_param(mode: str, other: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    if n <= 0:
+        return 0
+    return walk_other_param(other, other, n - 1)
+
+def walk_reassigned(mode: str, raw: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    mode = raw
+    if n <= 0:
+        return 0
+    return walk_reassigned(mode, raw, n - 1)
+
+def outer_ok(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return inner_ok(mode)
+
+def inner_ok(mode: str) -> int:
+    if mode not in ("a", "b", "c"):
+        raise ValueError(mode)
+    return 1
+
+def wide_outer(mode: str) -> int:
+    if mode not in ("a", "b", "c"):
+        raise ValueError(mode)
+    return narrow_inner(mode)
+
+def narrow_inner(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def dyn_outer(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return dyn_inner(mode)
+
+def dyn_inner(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def unguarded_outer(mode: str) -> int:
+    return guarded_target(mode)
+
+def guarded_target(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def ping(mode: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 0 if n <= 0 else pong(mode, n - 1)
+
+def pong(mode: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 0 if n <= 0 else ping(mode, n - 1)
+
+def ping_mismatch(mode: str, n: int) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 0 if n <= 0 else pong_mismatch(mode, n - 1)
+
+def pong_mismatch(mode: str, n: int) -> int:
+    if mode not in ("a", "b", "c"):
+        raise ValueError(mode)
+    return 0 if n <= 0 else ping_mismatch(mode, n - 1)
+
+def entry(raw: str) -> None:
+    outer_ok("a")
+    dyn_outer(raw)
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2, closed_world=True)
+    nt101_fns = {c.symbol.rsplit(".", maxsplit=1)[-1] for c in cands if c.code == RuleCode.NT101}
+
+    assert "walk" in nt101_fns
+    assert "outer_ok" in nt101_fns
+    assert "inner_ok" in nt101_fns
+    assert "wide_outer" in nt101_fns
+    assert "ping" in nt101_fns
+    assert "pong" in nt101_fns
+
+    assert "walk_bad_lit" not in nt101_fns
+    assert "walk_other_param" not in nt101_fns
+    assert "walk_reassigned" not in nt101_fns
+    assert "narrow_inner" not in nt101_fns
+    assert "dyn_outer" not in nt101_fns
+    assert "dyn_inner" not in nt101_fns
+    assert "guarded_target" not in nt101_fns
+    assert "ping_mismatch" not in nt101_fns
+    assert "pong_mismatch" not in nt101_fns

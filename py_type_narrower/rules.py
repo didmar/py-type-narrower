@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         CodebaseIndex,
         FieldInfo,
         FunctionInfo,
+        ObservedArg,
         ParamCallStats,
         ParamInfo,
     )
@@ -118,6 +119,7 @@ class _RuleEvalContext:
     index: CodebaseIndex
     config: NarrowerConfig
     active: set[RuleCode]
+    resolved_targets: set[Path] | None = None
 
 
 def run_rules(
@@ -131,8 +133,13 @@ def run_rules(
     When `target_files` is provided, only definitions inside those files are reported,
     while the full index still supplies cross-file call sites and class hierarchies.
     """
-    ctx = _RuleEvalContext(index=index, config=config, active=config.active_rules())
     resolved_targets = {p.resolve() for p in target_files} if target_files is not None else None
+    ctx = _RuleEvalContext(
+        index=index,
+        config=config,
+        active=config.active_rules(),
+        resolved_targets=resolved_targets,
+    )
     candidates: list[NarrowingCandidate] = []
 
     for func in sorted(index.functions.values(), key=lambda f: (str(f.file), f.line, f.col)):
@@ -218,9 +225,7 @@ def _run_tier2_function_rules(
         if param.name in nt101_params:
             continue
         guarded = _extract_nt101_matching_literals(func, param, ctx.index)
-        if guarded is not None and _has_incompatible_nt101_caller(
-            func, param, guarded[0], ctx.index
-        ):
+        if guarded is not None and _has_incompatible_nt101_caller(func, param, guarded[0], ctx):
             continue
         stats = ctx.index.call_stats.get((func.qualname, param.name))
         if stats is None or not stats.observations or stats.has_dynamic_star_call:
@@ -269,7 +274,7 @@ def _rule_nt101_guarded_params(
         matching, reasons = extracted
         if len(matching) > ctx.config.max_literals:
             continue
-        if _has_incompatible_nt101_caller(func, param, matching, ctx.index):
+        if _has_incompatible_nt101_caller(func, param, matching, ctx):
             continue
 
         suggested = format_literal_type(matching)
@@ -301,6 +306,100 @@ def _rule_nt101_guarded_params(
             )
         )
     return results
+
+
+def _has_incompatible_nt101_caller(
+    func: FunctionInfo,
+    param: ParamInfo,
+    matching: set[ExtractedLiteral],
+    ctx: _RuleEvalContext,
+    visiting: frozenset[tuple[str, str]] = frozenset(),
+) -> bool:
+    """Return True if any indexed caller passes a non-literal or out-of-set argument to `param`."""
+    stats = ctx.index.call_stats.get((func.qualname, param.name))
+    if stats is None:
+        return False
+    if stats.has_dynamic_star_call:
+        return True
+    current_key = (func.qualname, param.name)
+    next_visiting = visiting | {current_key}
+    return any(
+        not _is_compatible_nt101_observation(obs, current_key, matching, ctx, next_visiting)
+        for obs in stats.observations
+    )
+
+
+def _is_compatible_nt101_observation(
+    obs: ObservedArg,
+    current_key: tuple[str, str],
+    matching: set[ExtractedLiteral],
+    ctx: _RuleEvalContext,
+    visiting: frozenset[tuple[str, str]],
+) -> bool:
+    """Return True if a single call-site observation is compatible with NT101 `matching`."""
+    if not obs.is_unknown and not obs.is_none and obs.literals:
+        return all(lit in matching for lit in obs.literals)
+    if obs.is_none or obs.forwarded_from is None:
+        return False
+    if obs.forwarded_from == current_key:
+        return True
+    return _is_compatible_forwarded_nt101_param(obs.forwarded_from, matching, ctx, visiting)
+
+
+def _is_compatible_forwarded_nt101_param(
+    caller_key: tuple[str, str],
+    matching: set[ExtractedLiteral],
+    ctx: _RuleEvalContext,
+    visiting: frozenset[tuple[str, str]],
+) -> bool:
+    """Return True if `caller_key` is itself NT101-narrowable to a subset of `matching`."""
+    resolved = _resolve_narrowable_nt101_caller_param(caller_key, ctx)
+    if resolved is None:
+        return False
+    caller_fn, caller_param = resolved
+    extracted = _extract_nt101_matching_literals(caller_fn, caller_param, ctx.index)
+    if extracted is None:
+        return False
+    caller_matching, _reasons = extracted
+    if len(caller_matching) > ctx.config.max_literals or not caller_matching.issubset(matching):
+        return False
+    if caller_key in visiting:
+        return True
+    return not _has_incompatible_nt101_caller(
+        caller_fn, caller_param, caller_matching, ctx, visiting
+    )
+
+
+def _resolve_narrowable_nt101_caller_param(
+    caller_key: tuple[str, str],
+    ctx: _RuleEvalContext,
+) -> tuple[FunctionInfo, ParamInfo] | None:
+    """Return `(caller_fn, caller_param)` if `caller_key` is eligible for NT101 narrowing."""
+    if RuleCode.NT101 not in ctx.active:
+        return None
+    caller_qual, caller_param_name = caller_key
+    caller_fn = ctx.index.functions.get(caller_qual)
+    if (
+        caller_fn is None
+        or _skip_param_narrowing_for_hierarchy(caller_fn)
+        or (
+            ctx.resolved_targets is not None
+            and caller_fn.file.resolve() not in ctx.resolved_targets
+        )
+        or (caller_fn.is_test_file and not ctx.config.include_test_files)
+        or score_tier1_guarded_param(is_private=caller_fn.is_private) < ctx.config.min_confidence
+    ):
+        return None
+    caller_param = next(
+        (p for p in _non_receiver_params(caller_fn) if p.name == caller_param_name),
+        None,
+    )
+    if caller_param is None:
+        return None
+    file_ignores = ctx.index.ignores.get(caller_fn.file, {})
+    if is_ignored(file_ignores, caller_param.line, RuleCode.NT101.value):
+        return None
+    return (caller_fn, caller_param)
 
 
 def _extract_nt101_matching_literals(
@@ -349,27 +448,6 @@ def _collect_guarded_literals_for_param(
             matching.update(enum_cls.enum_values)
             reasons.append(f"Coerced via `{callee}({param.name})`")
     return (matching, reasons)
-
-
-def _has_incompatible_nt101_caller(
-    func: FunctionInfo,
-    param: ParamInfo,
-    matching: set[ExtractedLiteral],
-    index: CodebaseIndex,
-) -> bool:
-    """Return True if any indexed caller passes a non-literal or out-of-set argument to `param`."""
-    stats = index.call_stats.get((func.qualname, param.name))
-    if stats is None:
-        return False
-    if stats.has_dynamic_star_call:
-        return True
-    return any(
-        obs.is_unknown
-        or obs.is_none
-        or not obs.literals
-        or any(lit not in matching for lit in obs.literals)
-        for obs in stats.observations
-    )
 
 
 def _rule_nt102_unused_optional_return(

@@ -146,6 +146,7 @@ class ObservedArg:
     observed_type: str | None = None
     dict_literal_keys: tuple[tuple[str, str | None], ...] | None = None
     enum_qualname: str | None = None
+    forwarded_from: tuple[str, str] | None = None
 
 
 @dataclass
@@ -1055,6 +1056,7 @@ class _LocalVarBinding:
     is_non_none: bool = False
     class_type: str | None = None
     inferred_type: str | None = None
+    origin_param: tuple[str, str] | None = None
 
 
 def _detect_enum_kind(bases: list[str]) -> TypingLiteral["str", "int"] | None:
@@ -1234,6 +1236,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         self._classes_by_short_name = classes_by_short_name
         self._class_stack: list[str] = []
         self._return_typeddict_stack: list[ClassInfo | None] = []
+        self._func_depth = 0
         # Each entry is `(is_class_scope, bindings)`; class scopes do not enclose methods in Python.
         self._scope_stack: list[tuple[bool, dict[str, _LocalVarBinding]]] = [(False, {})]
 
@@ -1247,6 +1250,19 @@ class _CallSiteCollector(cst.CSTVisitor):
         self._class_stack.pop()
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:  # noqa: N802
+        in_nested = self._func_depth > 0
+        self._func_depth += 1
+        func_qualname: str | None = None
+        if not in_nested:
+            cls_name = self._class_stack[-1] if self._class_stack else None
+            candidate_qual = (
+                f"{self.ctx.module_name}.{cls_name}.{node.name.value}"
+                if cls_name is not None
+                else f"{self.ctx.module_name}.{node.name.value}"
+            )
+            if candidate_qual in self.index.functions:
+                func_qualname = candidate_qual
+
         scope: dict[str, _LocalVarBinding] = {}
         for p in (*node.params.posonly_params, *node.params.params, *node.params.kwonly_params):
             ann = p.annotation
@@ -1256,11 +1272,13 @@ class _CallSiteCollector(cst.CSTVisitor):
             is_non_none = (
                 ann is not None and extract_optional_inner(ann) is None and ann_str != "None"
             )
+            origin = (func_qualname, p.name.value) if func_qualname is not None else None
             scope[p.name.value] = _LocalVarBinding(
                 literals=lits,
                 is_non_none=is_non_none,
                 class_type=class_ref,
                 inferred_type=ann_str,
+                origin_param=origin,
             )
         self._scope_stack.append((False, scope))
         ret_td: ClassInfo | None = None
@@ -1273,6 +1291,7 @@ class _CallSiteCollector(cst.CSTVisitor):
         return True
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:  # noqa: ARG002, N802
+        self._func_depth -= 1
         self._scope_stack.pop()
         self._return_typeddict_stack.pop()
 
@@ -1842,6 +1861,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                     is_non_none=True,
                     literals=binding.literals,
                     observed_type=obs_type,
+                    forwarded_from=binding.origin_param,
                 )
             if binding.is_non_none:
                 enum_cls = (
@@ -1857,6 +1877,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                     is_unknown=True,
                     observed_type=binding.inferred_type,
                     enum_qualname=enum_cls.qualname if enum_cls is not None else None,
+                    forwarded_from=binding.origin_param,
                 )
             if binding.inferred_type is not None:
                 return ObservedArg(
@@ -1865,6 +1886,15 @@ class _CallSiteCollector(cst.CSTVisitor):
                     is_test_caller=self.ctx.is_test_file,
                     is_unknown=True,
                     observed_type=binding.inferred_type,
+                    forwarded_from=binding.origin_param,
+                )
+            if binding.origin_param is not None:
+                return ObservedArg(
+                    file=self.ctx.file,
+                    line=line,
+                    is_test_caller=self.ctx.is_test_file,
+                    is_unknown=True,
+                    forwarded_from=binding.origin_param,
                 )
         return ObservedArg(
             file=self.ctx.file,
