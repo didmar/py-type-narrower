@@ -63,7 +63,6 @@ class _AttrDecl:
     """Candidate attribute declaration found on class body or in `__init__`."""
 
     name: str
-    node: cst.CSTNode
     annotation_str: str
     optional_inner: str | None
     primitive_kind: TypingLiteral["str", "int"] | None
@@ -89,7 +88,7 @@ class _AttrWriteSummary:
 def analyze_class_attributes(
     cls_node: cst.ClassDef,
     known_class_names: set[str],
-    get_position: Callable[[cst.CSTNode], tuple[int, int]],
+    get_position: Callable[[str, bool], tuple[int, int]],
 ) -> list[ClassAttrFact]:
     """Find class attributes narrowable from class-body and method assignments."""
     stmts = _extract_suite_stmts(cls_node.body)
@@ -128,11 +127,11 @@ def _build_attr_fact(
     decl: _AttrDecl,
     summary: _AttrWriteSummary,
     guaranteed_in_init: bool,
-    get_position: Callable[[cst.CSTNode], tuple[int, int]],
+    get_position: Callable[[str, bool], tuple[int, int]],
 ) -> ClassAttrFact | None:
     """Convert one attribute declaration + write summary into a ClassAttrFact if narrowable."""
     if decl.optional_inner is not None and guaranteed_in_init and not summary.disqualified_non_none:
-        line, col = get_position(decl.node)
+        line, col = get_position(decl.name, decl.declared_in_init)
         return ClassAttrFact(
             name=decl.name,
             line=line,
@@ -149,7 +148,7 @@ def _build_attr_fact(
         and not summary.has_non_literal
         and summary.literals
     ):
-        line, col = get_position(decl.node)
+        line, col = get_position(decl.name, decl.declared_in_init)
         return ClassAttrFact(
             name=decl.name,
             line=line,
@@ -166,7 +165,7 @@ def _build_attr_fact(
         and not summary.has_unknown_type
         and summary.observed_types
     ):
-        line, col = get_position(decl.node)
+        line, col = get_position(decl.name, decl.declared_in_init)
         return ClassAttrFact(
             name=decl.name,
             line=line,
@@ -261,9 +260,7 @@ class _InitAttrCollector(cst.CSTVisitor):
         attr = _self_attr_name(node.target)
         if attr is None:
             return True
-        decl = _make_attr_decl(
-            attr, node.target, node.annotation, node.value, declared_in_init=True
-        )
+        decl = _make_attr_decl(attr, node.annotation, node.value, declared_in_init=True)
         if decl is not None:
             self.decls[attr] = decl
         return True
@@ -283,7 +280,6 @@ def _collect_attr_decls(
                 continue
             decl = _make_attr_decl(
                 small.target.value,
-                small.target,
                 small.annotation,
                 small.value,
                 declared_in_init=False,
@@ -300,7 +296,6 @@ def _collect_attr_decls(
 
 def _make_attr_decl(
     name: str,
-    target_node: cst.CSTNode,
     annotation: cst.Annotation,
     value: cst.BaseExpression | None,
     *,
@@ -317,7 +312,6 @@ def _make_attr_decl(
         return None
     return _AttrDecl(
         name=name,
-        node=target_node,
         annotation_str=ann_str,
         optional_inner=opt_inner,
         primitive_kind=prim_kind,

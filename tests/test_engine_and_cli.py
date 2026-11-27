@@ -10,7 +10,7 @@ from py_type_narrower.cli import main
 from py_type_narrower.config import NarrowerConfig, load_config
 from py_type_narrower.engine import RunOptions, analyze_paths
 from py_type_narrower.flake8_plugin import TypeNarrowerChecker
-from py_type_narrower.indexer import discover_python_files
+from py_type_narrower.indexer import discover_python_files, index_files
 from py_type_narrower.models import RuleCode
 
 
@@ -340,3 +340,35 @@ def run() -> None:
     payload_base = json.loads(capsys.readouterr().out)
     assert rc_base == 1
     assert [c["file"] for c in payload_base["candidates"]] == ["changed.py"]
+
+
+def test_ast_position_lookup_handles_async_unicode_and_no_type_check(tmp_path: Path) -> None:
+    code = """from typing import no_type_check
+
+@no_type_check
+def a(mode: str) -> int:
+    return 0
+
+async def a(résumé: str, mode: str) -> str | None:
+    if mode not in ("x", "y"):
+        raise ValueError(mode)
+    return résumé
+
+class Box:
+    def __init__(self, val: str) -> None:
+        self.item: str | None = val
+"""
+    mod = tmp_path / "positions.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+
+    fn = index.functions["positions.a"]
+    assert (fn.line, fn.col) == (7, 10)
+    assert fn.return_line == 7
+    mode_param = next(p for p in fn.parameters if p.name == "mode")
+    assert (mode_param.line, mode_param.col) == (7, 25)
+
+    cls = index.classes["positions.Box"]
+    assert (cls.line, cls.col) == (12, 6)
+    assert len(cls.attr_facts) == 1
+    assert (cls.attr_facts[0].line, cls.attr_facts[0].col) == (14, 8)

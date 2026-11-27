@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal as TypingLiteral
 
 import libcst as cst
-from libcst.metadata import MetadataWrapper, PositionProvider
 
 from py_type_narrower.body_analysis import (
     BodyAnalysisContext,
@@ -223,7 +224,7 @@ class _ModuleContext:
     file: Path
     module_name: str
     is_test_file: bool
-    wrapper: MetadataWrapper
+    module: cst.Module
     imports: dict[str, str]
     module_imports: dict[str, str]
     class_names: set[str]
@@ -499,6 +500,49 @@ def _method_exists_in_bases(
 
 
 @dataclass(frozen=True)
+class _AstClassPositions:
+    """Line/column positions for one ClassDef and its class-body / `__init__` attributes."""
+
+    line: int
+    col: int
+    body_attrs: dict[str, tuple[int, int]]
+    init_attrs: dict[str, tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class _AstFuncPositions:
+    """Line/column positions for a function, its return annotation, and its parameters."""
+
+    line: int
+    col: int
+    return_line: int
+    return_col: int
+    params: dict[str, tuple[int, int]]
+
+
+class _AstPositionIndex:
+    """Lightweight line/column lookup built from stdlib `ast.parse`."""
+
+    def __init__(self) -> None:
+        self.classes: dict[tuple[tuple[str, ...], str], deque[_AstClassPositions]] = {}
+        self.functions: dict[tuple[tuple[str, ...], str], deque[_AstFuncPositions]] = {}
+
+    def pop_class(self, scope: tuple[str, ...], name: str) -> _AstClassPositions:
+        """Pop the next recorded class position entry for `(scope, name)`."""
+        bucket = self.classes.get((scope, name))
+        if bucket:
+            return bucket.popleft()
+        return _AstClassPositions(line=1, col=0, body_attrs={}, init_attrs={})
+
+    def pop_function(self, scope: tuple[str, ...], name: str) -> _AstFuncPositions:
+        """Pop the next recorded function position entry for `(scope, name)`."""
+        bucket = self.functions.get((scope, name))
+        if bucket:
+            return bucket.popleft()
+        return _AstFuncPositions(line=1, col=0, return_line=1, return_col=0, params={})
+
+
+@dataclass(frozen=True)
 class _DefCollectionConfig:
     """Module-level context passed to _DefinitionCollector."""
 
@@ -508,12 +552,11 @@ class _DefCollectionConfig:
     exported_all: set[str] | None
     const_dicts: dict[str, set[ExtractedLiteral]]
     known_class_names: set[str]
+    positions: _AstPositionIndex
 
 
 class _DefinitionCollector(cst.CSTVisitor):
     """Collect classes, functions, parameters, and local body facts in a single module."""
-
-    METADATA_DEPENDENCIES = (PositionProvider,)
 
     def __init__(self, cfg: _DefCollectionConfig, index: CodebaseIndex) -> None:
         self.file = cfg.file
@@ -522,6 +565,7 @@ class _DefinitionCollector(cst.CSTVisitor):
         self.exported_all = cfg.exported_all
         self.const_dicts = cfg.const_dicts
         self.known_class_names = cfg.known_class_names
+        self._positions = cfg.positions
         self.index = index
         self._class_stack: list[ClassInfo] = []
         self._class_attr_types_stack: list[dict[str, str]] = []
@@ -530,7 +574,8 @@ class _DefinitionCollector(cst.CSTVisitor):
     def visit_ClassDef(self, node: cst.ClassDef) -> bool:  # noqa: N802
         if _has_decorator(node, {"no_type_check"}):
             return False
-        pos = self.get_metadata(PositionProvider, node.name)
+        scope = tuple(c.name for c in self._class_stack)
+        cls_pos = self._positions.pop_class(scope, node.name.value)
         bases = [
             expr_to_code(arg.value.value)
             if isinstance(arg.value, cst.Subscript)
@@ -563,6 +608,7 @@ class _DefinitionCollector(cst.CSTVisitor):
         fields = (
             self._extract_structured_fields(
                 node,
+                cls_pos=cls_pos,
                 is_kw_only_dc=is_kw_only_dc or is_kw_only_attrs or is_pydantic,
                 is_typeddict=is_typeddict,
                 typeddict_total=typeddict_total,
@@ -571,7 +617,11 @@ class _DefinitionCollector(cst.CSTVisitor):
             else []
         )
         attr_facts = (
-            analyze_class_attributes(node, self.known_class_names, self._node_position)
+            analyze_class_attributes(
+                node,
+                self.known_class_names,
+                lambda name, in_init: _lookup_class_attr_position(cls_pos, name, in_init=in_init),
+            )
             if not (is_proto_abc or is_structured or enum_kind)
             else []
         )
@@ -581,8 +631,8 @@ class _DefinitionCollector(cst.CSTVisitor):
             module_name=self.module_name,
             bases=bases,
             file=self.file,
-            line=pos.start.line,
-            col=pos.start.column,
+            line=cls_pos.line,
+            col=cls_pos.col,
             is_private=is_private,
             is_test_file=self.is_test_file,
             is_protocol_or_abc=is_proto_abc,
@@ -604,15 +654,11 @@ class _DefinitionCollector(cst.CSTVisitor):
         self._class_attr_types_stack.append(_collect_class_self_attr_types(node))
         return True
 
-    def _node_position(self, node: cst.CSTNode) -> tuple[int, int]:
-        """Return 1-based line and 0-based column for a CST node."""
-        pos = self.get_metadata(PositionProvider, node)
-        return (pos.start.line, pos.start.column)
-
     def _extract_structured_fields(
         self,
         cls_node: cst.ClassDef,
         *,
+        cls_pos: _AstClassPositions,
         is_kw_only_dc: bool,
         is_typeddict: bool = False,
         typeddict_total: bool = True,
@@ -634,67 +680,17 @@ class _DefinitionCollector(cst.CSTVisitor):
                     continue
                 if ann_str.startswith(("ClassVar", "typing.ClassVar")):
                     continue
-                field_info = self._build_field_info(
+                field_pos = cls_pos.body_attrs.get(small.target.value, (cls_pos.line, cls_pos.col))
+                field_info = _build_field_info(
                     small,
                     ann_str,
+                    position=field_pos,
                     kw_only_active=kw_only_active,
-                    is_typeddict=is_typeddict,
-                    typeddict_total=typeddict_total,
+                    typeddict_total=typeddict_total if is_typeddict else None,
                 )
                 if field_info is not None:
                     fields.append(field_info)
         return fields
-
-    def _build_field_info(
-        self,
-        stmt: cst.AnnAssign,
-        ann_str: str,
-        *,
-        kw_only_active: bool,
-        is_typeddict: bool = False,
-        typeddict_total: bool = True,
-    ) -> FieldInfo | None:
-        """Build a FieldInfo from a single class-body AnnAssign, skipping init=False fields."""
-        if not isinstance(stmt.target, cst.Name):
-            return None
-        val = stmt.value
-        field_kw_only = kw_only_active
-        has_default = val is not None
-        default_is_none = False
-        default_lit: ExtractedLiteral | None = None
-
-        if val is not None and _is_structured_field_call(val):
-            init_flag, dc_has_default, dc_kw_only, default_is_none, default_lit = (
-                _parse_structured_field_call(val)
-            )
-            if not init_flag:
-                return None
-            has_default = dc_has_default
-            field_kw_only = field_kw_only or dc_kw_only
-        elif val is not None:
-            default_is_none = is_none_expr(val)
-            default_lit = extract_literal(val)
-
-        not_req_inner = extract_not_required_inner(stmt.annotation) if is_typeddict else None
-        req_inner = extract_required_inner(stmt.annotation) if is_typeddict else None
-        is_not_required = not_req_inner is not None or (
-            is_typeddict and not typeddict_total and req_inner is None
-        )
-        pos = self.get_metadata(PositionProvider, stmt.target)
-        return FieldInfo(
-            name=stmt.target.value,
-            line=pos.start.line,
-            col=pos.start.column,
-            annotation_str=ann_str,
-            primitive_kind=base_primitive_annotation(stmt.annotation),
-            optional_inner=extract_optional_inner(stmt.annotation),
-            has_default=has_default or is_not_required,
-            default_is_none=default_is_none,
-            default_literal=default_lit,
-            is_kw_only=field_kw_only,
-            is_not_required=is_not_required,
-            not_required_inner=not_req_inner,
-        )
 
     def leave_ClassDef(self, original_node: cst.ClassDef) -> None:  # noqa: N802
         if not _has_decorator(original_node, {"no_type_check"}):
@@ -707,7 +703,8 @@ class _DefinitionCollector(cst.CSTVisitor):
         if in_nested or _has_decorator(node, {"no_type_check"}):
             return True
 
-        pos = self.get_metadata(PositionProvider, node.name)
+        scope = tuple(c.name for c in self._class_stack)
+        fn_pos = self._positions.pop_function(scope, node.name.value)
         current_cls = self._class_stack[-1] if self._class_stack else None
         is_method = current_cls is not None
         if current_cls is not None:
@@ -720,7 +717,7 @@ class _DefinitionCollector(cst.CSTVisitor):
             else f"{self.module_name}.{node.name.value}"
         )
 
-        params = self._extract_params(node.params)
+        params = self._extract_params(node.params, fn_pos)
         is_staticmethod = _has_decorator(node, {"staticmethod"})
         return_annotation_str = (
             expr_to_code(node.returns.annotation) if node.returns is not None else None
@@ -772,18 +769,14 @@ class _DefinitionCollector(cst.CSTVisitor):
         else:
             body_facts = BodyFacts(returns=ReturnSummary())
 
-        ret_pos = (
-            self.get_metadata(PositionProvider, node.returns) if node.returns is not None else pos
-        )
-
         info = FunctionInfo(
             qualname=qualname,
             name=node.name.value,
             module_name=self.module_name,
             class_name=cls_name,
             file=self.file,
-            line=pos.start.line,
-            col=pos.start.column,
+            line=fn_pos.line,
+            col=fn_pos.col,
             is_private=_is_symbol_private(
                 node.name.value, cls_name, self.exported_all, in_nested_function=False
             ),
@@ -800,8 +793,8 @@ class _DefinitionCollector(cst.CSTVisitor):
             return_annotation_str=return_annotation_str,
             return_primitive_kind=return_primitive_kind,
             return_optional_inner=return_optional_inner,
-            return_line=ret_pos.start.line,
-            return_col=ret_pos.start.column,
+            return_line=fn_pos.return_line,
+            return_col=fn_pos.return_col,
             body_facts=body_facts,
             return_union_members=return_union_members,
         )
@@ -829,7 +822,11 @@ class _DefinitionCollector(cst.CSTVisitor):
             return False
         return super().on_visit(node)
 
-    def _extract_params(self, params: cst.Parameters) -> list[ParamInfo]:
+    def _extract_params(
+        self,
+        params: cst.Parameters,
+        fn_pos: _AstFuncPositions,
+    ) -> list[ParamInfo]:
         """Extract ParamInfo records for posonly, regular, and kwonly parameters."""
         result: list[ParamInfo] = []
         groups: list[tuple[TypingLiteral["posonly", "regular", "kwonly"], list[cst.Param]]] = [
@@ -839,13 +836,13 @@ class _DefinitionCollector(cst.CSTVisitor):
         ]
         for kind, group in groups:
             for p in group:
-                pos = self.get_metadata(PositionProvider, p.name)
+                p_line, p_col = fn_pos.params.get(p.name.value, (fn_pos.line, fn_pos.col))
                 default = p.default
                 result.append(
                     ParamInfo(
                         name=p.name.value,
-                        line=pos.start.line,
-                        col=pos.start.column,
+                        line=p_line,
+                        col=p_col,
                         annotation_str=(
                             expr_to_code(p.annotation.annotation)
                             if p.annotation is not None
@@ -914,7 +911,7 @@ def _index_module_definitions(
     index.files[resolved] = source
     index.ignores[resolved] = parse_file_ignores(source)
 
-    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    positions = _build_ast_position_index(source)
     const_dicts = extract_module_const_dicts(module)
     exported_all = _extract_dunder_all(module)
     imports, module_imports = _extract_imports(module, module_name)
@@ -929,20 +926,258 @@ def _index_module_definitions(
             exported_all=exported_all,
             const_dicts=const_dicts,
             known_class_names=class_names,
+            positions=positions,
         ),
         index=index,
     )
-    wrapper.visit(collector)
+    module.visit(collector)
 
     return _ModuleContext(
         file=resolved,
         module_name=module_name,
         is_test_file=test_file,
-        wrapper=wrapper,
+        module=module,
         imports=imports,
         module_imports=module_imports,
         class_names=class_names,
     )
+
+
+def _build_field_info(
+    stmt: cst.AnnAssign,
+    ann_str: str,
+    *,
+    position: tuple[int, int],
+    kw_only_active: bool,
+    typeddict_total: bool | None = None,
+) -> FieldInfo | None:
+    """Build a FieldInfo from a single class-body AnnAssign, skipping init=False fields."""
+    if not isinstance(stmt.target, cst.Name):
+        return None
+    val = stmt.value
+    field_kw_only = kw_only_active
+    has_default = val is not None
+    default_is_none = False
+    default_lit: ExtractedLiteral | None = None
+
+    if val is not None and _is_structured_field_call(val):
+        init_flag, dc_has_default, dc_kw_only, default_is_none, default_lit = (
+            _parse_structured_field_call(val)
+        )
+        if not init_flag:
+            return None
+        has_default = dc_has_default
+        field_kw_only = field_kw_only or dc_kw_only
+    elif val is not None:
+        default_is_none = is_none_expr(val)
+        default_lit = extract_literal(val)
+
+    is_typeddict = typeddict_total is not None
+    not_req_inner = extract_not_required_inner(stmt.annotation) if is_typeddict else None
+    req_inner = extract_required_inner(stmt.annotation) if is_typeddict else None
+    is_not_required = not_req_inner is not None or (
+        is_typeddict and not typeddict_total and req_inner is None
+    )
+    return FieldInfo(
+        name=stmt.target.value,
+        line=position[0],
+        col=position[1],
+        annotation_str=ann_str,
+        primitive_kind=base_primitive_annotation(stmt.annotation),
+        optional_inner=extract_optional_inner(stmt.annotation),
+        has_default=has_default or is_not_required,
+        default_is_none=default_is_none,
+        default_literal=default_lit,
+        is_kw_only=field_kw_only,
+        is_not_required=is_not_required,
+        not_required_inner=not_req_inner,
+    )
+
+
+def _lookup_class_attr_position(
+    cls_pos: _AstClassPositions,
+    attr_name: str,
+    *,
+    in_init: bool,
+) -> tuple[int, int]:
+    """Resolve `(line, col)` for a class-body or `__init__` annotated attribute."""
+    table = cls_pos.init_attrs if in_init else cls_pos.body_attrs
+    return table.get(attr_name, (cls_pos.line, cls_pos.col))
+
+
+def _build_ast_position_index(source: str) -> _AstPositionIndex:
+    """Build a fast line/column index using stdlib `ast.parse` instead of LibCST PositionProvider."""
+    pos_index = _AstPositionIndex()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return pos_index
+    lines = source.splitlines()
+    _walk_ast_statements(tree.body, (), 0, lines, pos_index)
+    return pos_index
+
+
+def _walk_ast_statements(
+    stmts: list[ast.stmt],
+    class_scope: tuple[str, ...],
+    func_depth: int,
+    lines: list[str],
+    pos_index: _AstPositionIndex,
+) -> None:
+    """Walk AST statement lists in CST-matching order to record class/function/param positions."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.ClassDef):
+            if _has_ast_no_type_check(stmt):
+                continue
+            cls_pos = _extract_ast_class_positions(stmt, lines)
+            pos_index.classes.setdefault((class_scope, stmt.name), deque()).append(cls_pos)
+            _walk_ast_statements(stmt.body, (*class_scope, stmt.name), func_depth, lines, pos_index)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if func_depth == 0 and not _has_ast_no_type_check(stmt):
+                fn_pos = _extract_ast_func_positions(stmt, lines)
+                pos_index.functions.setdefault((class_scope, stmt.name), deque()).append(fn_pos)
+            _walk_ast_statements(stmt.body, class_scope, func_depth + 1, lines, pos_index)
+        else:
+            for child_body in _iter_compound_stmt_bodies(stmt):
+                _walk_ast_statements(child_body, class_scope, func_depth, lines, pos_index)
+
+
+def _extract_ast_class_positions(node: ast.ClassDef, lines: list[str]) -> _AstClassPositions:
+    """Extract class header, direct annotated attributes, and `__init__` attribute positions."""
+    cls_col = _find_def_name_col(lines, node.lineno, node.col_offset, node.name, keyword="class")
+    body_attrs: dict[str, tuple[int, int]] = {}
+    init_attrs: dict[str, tuple[int, int]] = {}
+    for stmt in node.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            body_attrs.setdefault(
+                stmt.target.id,
+                (
+                    stmt.target.lineno,
+                    _ast_char_col(lines, stmt.target.lineno, stmt.target.col_offset),
+                ),
+            )
+        elif (
+            isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and stmt.name == "__init__"
+            and not init_attrs
+        ):
+            _collect_ast_init_attrs(stmt.body, lines, init_attrs)
+    return _AstClassPositions(
+        line=node.lineno, col=cls_col, body_attrs=body_attrs, init_attrs=init_attrs
+    )
+
+
+def _collect_ast_init_attrs(
+    stmts: list[ast.stmt],
+    lines: list[str],
+    out: dict[str, tuple[int, int]],
+) -> None:
+    """Collect `self.<attr>: T` positions inside `__init__`, skipping nested classes/functions."""
+    for stmt in stmts:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Attribute)
+            and isinstance(stmt.target.value, ast.Name)
+            and stmt.target.value.id == "self"
+        ):
+            out.setdefault(
+                stmt.target.attr,
+                (
+                    stmt.target.lineno,
+                    _ast_char_col(lines, stmt.target.lineno, stmt.target.col_offset),
+                ),
+            )
+            continue
+        for child_body in _iter_compound_stmt_bodies(stmt):
+            _collect_ast_init_attrs(child_body, lines, out)
+
+
+def _extract_ast_func_positions(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    lines: list[str],
+) -> _AstFuncPositions:
+    """Extract function header, return annotation, and parameter positions."""
+    kw = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    fn_col = _find_def_name_col(lines, node.lineno, node.col_offset, node.name, keyword=kw)
+    if node.returns is not None:
+        ret_line = node.returns.lineno
+        ret_col = _ast_char_col(lines, ret_line, node.returns.col_offset)
+    else:
+        ret_line, ret_col = node.lineno, fn_col
+    params = {
+        arg.arg: (arg.lineno, _ast_char_col(lines, arg.lineno, arg.col_offset))
+        for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+    }
+    return _AstFuncPositions(
+        line=node.lineno,
+        col=fn_col,
+        return_line=ret_line,
+        return_col=ret_col,
+        params=params,
+    )
+
+
+def _iter_compound_stmt_bodies(stmt: ast.stmt) -> list[list[ast.stmt]]:
+    """Return nested statement lists inside compound AST statements in source order."""
+    if isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        return [stmt.body, stmt.orelse] if stmt.orelse else [stmt.body]
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return [stmt.body]
+    if isinstance(stmt, (ast.Try, ast.TryStar)):
+        bodies = [stmt.body, *(handler.body for handler in stmt.handlers)]
+        if stmt.orelse:
+            bodies.append(stmt.orelse)
+        if stmt.finalbody:
+            bodies.append(stmt.finalbody)
+        return bodies
+    if isinstance(stmt, ast.Match):
+        return [case.body for case in stmt.cases]
+    return []
+
+
+def _has_ast_no_type_check(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if an AST class/function has a `@no_type_check` decorator."""
+    for dec in node.decorator_list:
+        expr = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(expr, ast.Name) and expr.id == "no_type_check":
+            return True
+        if isinstance(expr, ast.Attribute) and expr.attr == "no_type_check":
+            return True
+    return False
+
+
+def _find_def_name_col(
+    lines: list[str],
+    lineno: int,
+    byte_col: int,
+    name: str,
+    *,
+    keyword: str,
+) -> int:
+    """Find the 0-based character column of a class or function name after its keyword."""
+    char_start = _ast_char_col(lines, lineno, byte_col)
+    if not (1 <= lineno <= len(lines)):
+        return char_start
+    line = lines[lineno - 1]
+    if keyword == "async def":
+        def_idx = line.find("def", char_start + 5)
+        search_from = def_idx + 3 if def_idx != -1 else char_start
+    else:
+        search_from = char_start + len(keyword)
+    idx = line.find(name, search_from)
+    return idx if idx != -1 else char_start
+
+
+def _ast_char_col(lines: list[str], lineno: int, byte_col: int) -> int:
+    """Convert a 0-based UTF-8 byte offset from `ast` to a 0-based character offset."""
+    if byte_col == 0 or not (1 <= lineno <= len(lines)):
+        return byte_col
+    line = lines[lineno - 1]
+    if line.isascii():
+        return byte_col
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
 
 
 def is_test_path(path: Path) -> bool:
@@ -1304,8 +1539,6 @@ def _parse_structured_field_call(
 class _CallSiteCollector(cst.CSTVisitor):
     """Resolve call expressions across a module and record argument observations."""
 
-    METADATA_DEPENDENCIES = (PositionProvider,)
-
     def __init__(
         self,
         ctx: _ModuleContext,
@@ -1382,10 +1615,7 @@ class _CallSiteCollector(cst.CSTVisitor):
             and self._return_typeddict_stack[-1] is not None
             and isinstance(node.value, cst.Dict)
         ):
-            pos = self.get_metadata(PositionProvider, node)
-            self._bind_typeddict_literal(
-                self._return_typeddict_stack[-1], node.value, pos.start.line
-            )
+            self._bind_typeddict_literal(self._return_typeddict_stack[-1], node.value, 0)
         return True
 
     def visit_Assign(self, node: cst.Assign) -> bool:  # noqa: N802
@@ -1411,8 +1641,7 @@ class _CallSiteCollector(cst.CSTVisitor):
                 ann_ref = expr_to_code(node.annotation.annotation).strip("'\"")
                 td_cls = self._lookup_class_by_ref(ann_ref)
                 if td_cls is not None and td_cls.is_typeddict:
-                    pos = self.get_metadata(PositionProvider, node)
-                    self._bind_typeddict_literal(td_cls, node.value, pos.start.line)
+                    self._bind_typeddict_literal(td_cls, node.value, 0)
         return True
 
     def visit_AugAssign(self, node: cst.AugAssign) -> bool:  # noqa: N802
@@ -1447,15 +1676,14 @@ class _CallSiteCollector(cst.CSTVisitor):
                     self._bind_unknown_target(elem.value)
 
     def visit_Call(self, node: cst.Call) -> bool:  # noqa: N802
-        pos = self.get_metadata(PositionProvider, node)
         target_fn, is_bound_call = self._resolve_call_target(node.func)
         if target_fn is not None:
-            self._bind_call_arguments(target_fn, node, pos.start.line, is_bound=is_bound_call)
+            self._bind_call_arguments(target_fn, node, 0, is_bound=is_bound_call)
             return True
 
         target_cls = self._resolve_structured_class_target(node.func)
         if target_cls is not None:
-            self._bind_field_arguments(target_cls, node, pos.start.line)
+            self._bind_field_arguments(target_cls, node, 0)
         return True
 
     def _record_attr_write(self, target: cst.Attribute, value: cst.BaseExpression) -> None:
@@ -1468,11 +1696,10 @@ class _CallSiteCollector(cst.CSTVisitor):
             return
         field_name = target.attr.value
         if any(f.name == field_name for f in cls_info.fields):
-            pos = self.get_metadata(PositionProvider, target)
             stats = self.index.field_stats.setdefault(
                 (cls_info.qualname, field_name), ParamCallStats()
             )
-            stats.observations.append(self._classify_arg_expr(value, pos.start.line))
+            stats.observations.append(self._classify_arg_expr(value, 0))
 
     def _record_typeddict_subscript_write(
         self,
@@ -1493,11 +1720,10 @@ class _CallSiteCollector(cst.CSTVisitor):
             return
         field_name = key_lit.value
         if any(f.name == field_name for f in cls_info.fields):
-            pos = self.get_metadata(PositionProvider, target)
             stats = self.index.field_stats.setdefault(
                 (cls_info.qualname, field_name), ParamCallStats()
             )
-            stats.observations.append(self._classify_arg_expr(value, pos.start.line))
+            stats.observations.append(self._classify_arg_expr(value, 0))
 
     def _bind_typeddict_literal(self, target: ClassInfo, expr: cst.Dict, line: int) -> None:
         """Bind keys/values of a dict literal typed as `target` TypedDict onto field_stats."""
@@ -2304,4 +2530,4 @@ def _collect_module_calls(
     collector = _CallSiteCollector(
         ctx=ctx, index=index, classes_by_short_name=classes_by_short_name
     )
-    ctx.wrapper.visit(collector)
+    ctx.module.visit(collector)
