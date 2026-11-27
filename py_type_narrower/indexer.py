@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal as TypingLiteral
@@ -275,7 +276,8 @@ def discover_python_files(paths: list[Path], exclude: list[str]) -> list[Path]:
         if path.is_file() and path.suffix == ".py":
             found.add(path)
         elif path.is_dir():
-            for root_dir, dirnames, filenames in path.walk():
+            for raw_root, dirnames, filenames in os.walk(path):
+                root_dir = Path(raw_root)
                 dirnames[:] = [
                     d
                     for d in dirnames

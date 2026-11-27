@@ -60,7 +60,7 @@ uv tool install py-type-narrower
 pip install py-type-narrower
 ```
 
-Requires Python 3.12+.
+Requires Python 3.11+.
 
 ## Usage
 

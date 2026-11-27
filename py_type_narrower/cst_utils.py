@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 from typing import Literal as TypingLiteral
 
 import libcst as cst
@@ -12,7 +12,7 @@ import libcst as cst
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-type LiteralScalar = str | int | bool
+LiteralScalar: TypeAlias = str | int | bool
 
 _BUILTIN_TYPE_CONSTRUCTORS: frozenset[str] = frozenset(
     {
