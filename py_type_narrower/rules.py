@@ -217,6 +217,11 @@ def _run_tier2_function_rules(
     for param in _non_receiver_params(func):
         if param.name in nt101_params:
             continue
+        guarded = _extract_nt101_matching_literals(func, param, ctx.index)
+        if guarded is not None and _has_incompatible_nt101_caller(
+            func, param, guarded[0], ctx.index
+        ):
+            continue
         stats = ctx.index.call_stats.get((func.qualname, param.name))
         if stats is None or not stats.observations or stats.has_dynamic_star_call:
             continue
@@ -258,19 +263,12 @@ def _rule_nt101_guarded_params(
 
     results: list[NarrowingCandidate] = []
     for param in _non_receiver_params(func):
-        if param.primitive_kind is None:
+        extracted = _extract_nt101_matching_literals(func, param, ctx.index)
+        if extracted is None:
             continue
-        guard = func.body_facts.param_guards.get(param.name)
-        if guard is None:
+        matching, reasons = extracted
+        if len(matching) > ctx.config.max_literals:
             continue
-        matching, reasons = _collect_guarded_literals_for_param(func, param, guard, ctx.index)
-        if not matching or len(matching) > ctx.config.max_literals:
-            continue
-        if param.has_default and param.default_literal is not None:
-            if param.default_literal.kind == param.primitive_kind:
-                matching = matching | {param.default_literal}
-            else:
-                continue
         if _has_incompatible_nt101_caller(func, param, matching, ctx.index):
             continue
 
@@ -289,7 +287,7 @@ def _rule_nt101_guarded_params(
                 symbol=func.qualname,
                 target_kind=TargetKind.PARAMETER,
                 target_name=param.name,
-                current_type=param.annotation_str or param.primitive_kind,
+                current_type=param.annotation_str or param.primitive_kind or "str",
                 suggested_type=suggested,
                 needs_literal_import=True,
                 message=(
@@ -303,6 +301,27 @@ def _rule_nt101_guarded_params(
             )
         )
     return results
+
+
+def _extract_nt101_matching_literals(
+    func: FunctionInfo,
+    param: ParamInfo,
+    index: CodebaseIndex,
+) -> tuple[set[ExtractedLiteral], list[str]] | None:
+    """Return `(matching_literals, reasons)` if `param` has a strict body guard, else None."""
+    if param.primitive_kind is None:
+        return None
+    guard = func.body_facts.param_guards.get(param.name)
+    if guard is None:
+        return None
+    matching, reasons = _collect_guarded_literals_for_param(func, param, guard, index)
+    if not matching:
+        return None
+    if param.has_default and param.default_literal is not None:
+        if param.default_literal.kind != param.primitive_kind:
+            return None
+        matching = matching | {param.default_literal}
+    return (matching, reasons)
 
 
 def _collect_guarded_literals_for_param(

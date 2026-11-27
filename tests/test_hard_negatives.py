@@ -9,11 +9,18 @@ from py_type_narrower.models import RuleCode
 from py_type_narrower.rules import run_rules
 
 
-def _run_on_code(tmp_path: Path, code: str, *, max_tier: int = 2, max_literals: int = 8):
+def _run_on_code(
+    tmp_path: Path,
+    code: str,
+    *,
+    max_tier: int = 2,
+    max_literals: int = 8,
+    closed_world: bool = False,
+):
     mod = tmp_path / "mod.py"
     mod.write_text(code, encoding="utf-8")
     index = index_files([mod], project_root=tmp_path)
-    cfg = NarrowerConfig(max_tier=max_tier, max_literals=max_literals)
+    cfg = NarrowerConfig(max_tier=max_tier, max_literals=max_literals, closed_world=closed_world)
     return run_rules(index, cfg)
 
 
@@ -527,3 +534,32 @@ def callers(raw: str, narrow: Literal["a", "b"], args: tuple[str]) -> None:
     assert "validator_star_call" not in nt101_fns
     assert "safe_with_literal_callers" in nt101_fns
     assert "safe_standalone" in nt101_fns
+
+
+def test_hard_negative_dropped_nt101_does_not_fall_through_to_nt201(tmp_path: Path) -> None:
+    code = """def validator_out_of_set(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def callers() -> None:
+    validator_out_of_set("invalid")
+    validator_out_of_set("invalid")
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=2, closed_world=True)
+    param_cands = [
+        (c.symbol.rsplit(".", maxsplit=1)[-1], c.code, c.suggested_type)
+        for c in cands
+        if c.target_name == "mode"
+    ]
+    assert param_cands == []
+
+    # Even with NT101 disabled, NT201 must not suggest a literal the strict body guard rejects.
+    mod = tmp_path / "mod_no_nt101.py"
+    mod.write_text(code, encoding="utf-8")
+    index = index_files([mod], project_root=tmp_path)
+    cands_no_nt101 = run_rules(
+        index,
+        NarrowerConfig(max_tier=2, closed_world=True, ignore={RuleCode.NT101}),
+    )
+    assert [c for c in cands_no_nt101 if c.target_name == "mode"] == []
