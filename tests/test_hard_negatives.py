@@ -419,3 +419,64 @@ def test_indexer_skips_hidden_dirs_and_libcst_logic_errors(tmp_path: Path, monke
     index = index_files([good, bad_file], project_root=tmp_path)
     assert good.resolve() in index.files
     assert bad_file.resolve() not in index.files
+
+
+def test_hard_negative_variance_aware_override_and_external_subclass_guards(
+    tmp_path: Path,
+) -> None:
+    code = """from collections.abc import Iterator, Mapping, Sequence
+from typing import Any, override
+
+from external_lib import ShellComplete
+
+class BashComplete(ShellComplete):
+    # Contravariant param narrowing (NT101) on public external-subclass method -> SKIP
+    def handle(self, mode: str) -> int:
+        if mode == "fast":
+            return 1
+        raise ValueError(mode)
+
+    # Invariant mutable dict return (NT109) on public external-subclass method -> SKIP
+    def source_vars(self) -> dict[str, Any]:
+        return {"prog_name": "app", "shell": "bash"}
+
+    # Invariant mutable list return (NT107) on public external-subclass method -> SKIP
+    def items(self) -> list[int | None]:
+        return [1, 2]
+
+    # Covariant Mapping / Iterator / Sequence returns on external subclass -> SAFE!
+    def readonly_vars(self) -> Mapping[str, Any]:
+        return {"prog_name": "app"}
+
+    def stream(self) -> Iterator[int | None]:
+        yield 1
+
+    def seq(self) -> Sequence[int | None]:
+        return [1, 2]
+
+    # Private helper on external subclass -> SAFE!
+    def _internal_dict(self) -> dict[str, Any]:
+        return {"k": 1}
+
+    # Explicit @override even on a private method -> SKIP contravariant / invariant!
+    @override
+    def _hook(self, kind: str) -> dict[str, Any]:
+        if kind == "a":
+            return {"k": 1}
+        raise ValueError(kind)
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=1)
+    found = {(c.symbol.rsplit(".", maxsplit=1)[-1], c.code) for c in cands}
+
+    # Skipped because contravariant param or invariant mutable return on external/override method
+    assert ("handle", RuleCode.NT101) not in found
+    assert ("source_vars", RuleCode.NT109) not in found
+    assert ("items", RuleCode.NT107) not in found
+    assert ("_hook", RuleCode.NT101) not in found
+    assert ("_hook", RuleCode.NT109) not in found
+
+    # Allowed because covariant return or private non-override helper
+    assert ("readonly_vars", RuleCode.NT109) in found
+    assert ("stream", RuleCode.NT107) in found
+    assert ("seq", RuleCode.NT107) in found
+    assert ("_internal_dict", RuleCode.NT109) in found

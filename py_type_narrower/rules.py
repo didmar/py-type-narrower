@@ -211,8 +211,6 @@ def _run_tier2_function_rules(
     """Evaluate whole-repo call-site function rules (NT201, NT204, NT202, NT205, NT206)."""
     if _skip_param_narrowing_for_hierarchy(func):
         return
-    if func.in_external_subclass and not func.is_private and func.name != "__init__":
-        return
     nt101_params = {
         c.target_name for c in out if c.symbol == func.qualname and c.code == RuleCode.NT101
     }
@@ -815,10 +813,12 @@ def _rule_nt107_container_non_none_return(
     ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT107: Container/generator return `list[T | None]` / `Iterator[T | None]` never yields None."""
-    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, ctx.config):
+    if func.return_annotation_str is None:
         return []
     spec = extract_optional_container_return(func.return_annotation_str)
-    if spec is None:
+    if spec is None or _skip_return_narrowing_for_protocol(
+        func, ctx.config, invariant=spec.is_mutable
+    ):
         return []
     ret = func.body_facts.returns
     if ret.is_stub:
@@ -1001,10 +1001,12 @@ def _rule_nt109_structured_dict_return(
     ctx: _RuleEvalContext,
 ) -> list[NarrowingCandidate]:
     """NT109: Structured dict return narrows to an existing TypedDict, dict[Literal, V], or TypedDict schema."""
-    if func.return_annotation_str is None or _skip_return_narrowing_for_protocol(func, ctx.config):
+    if func.return_annotation_str is None:
         return []
     dict_spec = extract_str_key_dict_annotation(func.return_annotation_str)
-    if dict_spec is None:
+    if dict_spec is None or _skip_return_narrowing_for_protocol(
+        func, ctx.config, invariant=dict_spec.is_mutable
+    ):
         return []
     ret = func.body_facts.returns
     if (
@@ -2123,23 +2125,36 @@ def _class_has_subclasses(cls: ClassInfo, index: CodebaseIndex) -> bool:
 
 
 def _skip_param_narrowing_for_hierarchy(func: FunctionInfo) -> bool:
-    """Skip parameter narrowing on overrides, ABCs, Protocols, abstract, and data-model methods."""
+    """Skip contravariant parameter narrowing on overrides, external subclasses, ABCs, or dunders."""
     return (
-        func.is_override
+        _may_override_base_contract(func)
         or func.is_abstract
         or func.in_protocol_or_abc
         or _is_data_model_dunder(func)
     )
 
 
-def _skip_return_narrowing_for_protocol(func: FunctionInfo, config: NarrowerConfig) -> bool:
-    """Skip return narrowing on abstract, Protocol/ABC, data-model, or overridden base methods."""
+def _skip_return_narrowing_for_protocol(
+    func: FunctionInfo,
+    config: NarrowerConfig,
+    *,
+    invariant: bool = False,
+) -> bool:
+    """Skip return narrowing on protocol/ABC/base hooks, and on overrides when `invariant=True`."""
     return (
         func.is_abstract
         or func.in_protocol_or_abc
         or func.is_overridden
         or (func.in_base_class and not func.is_private and not config.closed_world)
+        or (invariant and _may_override_base_contract(func))
         or _is_data_model_dunder(func)
+    )
+
+
+def _may_override_base_contract(func: FunctionInfo) -> bool:
+    """Return True if `func` overrides an indexed base method or is a public external-subclass method."""
+    return func.is_override or (
+        func.in_external_subclass and not func.is_private and func.name != "__init__"
     )
 
 

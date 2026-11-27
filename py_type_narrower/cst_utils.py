@@ -197,6 +197,7 @@ class DictAnnotationSpec:
     outer: str
     value_type: str | None  # None for bare `dict`, or `Any`/`object`/concrete type string
     is_broad_value: bool  # True when bare `dict` or value is `Any`/`object`
+    is_mutable: bool = True  # False for covariant `Mapping`
 
 
 _BROAD_VALUE_NAMES: frozenset[str] = frozenset({"Any", "typing.Any", "object", "builtins.object"})
@@ -240,6 +241,7 @@ class ContainerOptionalSpec:
 
     kind: TypingLiteral["seq", "dict", "generator", "iterable"]
     narrowed_annotation: str
+    is_mutable: bool = False  # True for invariant mutable containers (list, set, dict)
 
 
 _SEQ_CONTAINER_NAMES: frozenset[str] = frozenset(
@@ -286,20 +288,57 @@ _DICT_CONTAINER_NAMES: frozenset[str] = frozenset(
 )
 
 
+_MUTABLE_SEQ_NAMES: frozenset[str] = frozenset(
+    {
+        "list",
+        "builtins.list",
+        "List",
+        "typing.List",
+        "MutableSequence",
+        "typing.MutableSequence",
+        "collections.abc.MutableSequence",
+        "set",
+        "builtins.set",
+        "Set",
+        "typing.Set",
+        "MutableSet",
+        "typing.MutableSet",
+        "collections.abc.MutableSet",
+    }
+)
+_MUTABLE_DICT_NAMES: frozenset[str] = frozenset(
+    {
+        "dict",
+        "builtins.dict",
+        "Dict",
+        "typing.Dict",
+        "MutableMapping",
+        "typing.MutableMapping",
+        "collections.abc.MutableMapping",
+    }
+)
+
+
 def extract_str_key_dict_annotation(annotation_str: str | None) -> DictAnnotationSpec | None:
     """Return DictAnnotationSpec if annotation is `dict[str, V]`, `Mapping[str, V]`, or `dict`."""
     if annotation_str is None:
         return None
     stripped = annotation_str.strip()
     if stripped in _DICT_CONTAINER_NAMES:
-        return DictAnnotationSpec(outer=stripped, value_type=None, is_broad_value=True)
+        return DictAnnotationSpec(
+            outer=stripped,
+            value_type=None,
+            is_broad_value=True,
+            is_mutable=stripped in _MUTABLE_DICT_NAMES,
+        )
     expr = _parse_subscript_annotation(stripped)
     args = _extract_subscript_index_args(expr) if expr is not None else None
+    base_name = _annotation_simple_name(expr.value) if expr is not None else None
     if (
         expr is None
         or args is None
         or len(args) != _MIN_UNION_MEMBERS
-        or _annotation_simple_name(expr.value) not in _DICT_CONTAINER_NAMES
+        or base_name not in _DICT_CONTAINER_NAMES
         or _annotation_simple_name(args[0]) not in {"str", "builtins.str"}
     ):
         return None
@@ -308,6 +347,7 @@ def extract_str_key_dict_annotation(annotation_str: str | None) -> DictAnnotatio
         outer=expr_to_code(expr.value),
         value_type=val_str,
         is_broad_value=val_str in _BROAD_VALUE_NAMES,
+        is_mutable=base_name in _MUTABLE_DICT_NAMES,
     )
 
 
@@ -372,18 +412,32 @@ def _build_optional_container_spec(
     """Classify a subscripted container/generator annotation and strip Optional from its payload."""
     if base_name in _SEQ_CONTAINER_NAMES and len(args) == 1:
         inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
-        return ContainerOptionalSpec("seq", f"{outer}[{inner}]") if inner else None
+        return (
+            ContainerOptionalSpec(
+                "seq", f"{outer}[{inner}]", is_mutable=base_name in _MUTABLE_SEQ_NAMES
+            )
+            if inner
+            else None
+        )
     if (
         base_name in {"tuple", "builtins.tuple", "Tuple", "typing.Tuple"}
         and len(args) == _MIN_UNION_MEMBERS
         and isinstance(args[1], cst.Ellipsis)
     ):
         inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
-        return ContainerOptionalSpec("seq", f"{outer}[{inner}, ...]") if inner else None
+        return (
+            ContainerOptionalSpec("seq", f"{outer}[{inner}, ...]", is_mutable=False)
+            if inner
+            else None
+        )
     if base_name in _DICT_CONTAINER_NAMES and len(args) == _MIN_UNION_MEMBERS:
         inner = extract_optional_inner(cst.Annotation(annotation=args[1]))
         if inner:
-            return ContainerOptionalSpec("dict", f"{outer}[{expr_to_code(args[0])}, {inner}]")
+            return ContainerOptionalSpec(
+                "dict",
+                f"{outer}[{expr_to_code(args[0])}, {inner}]",
+                is_mutable=base_name in _MUTABLE_DICT_NAMES,
+            )
         return None
     if base_name in _GENERATOR_ONLY_NAMES or base_name in _ITERABLE_NAMES:
         inner = extract_optional_inner(cst.Annotation(annotation=args[0]))
