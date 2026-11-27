@@ -159,6 +159,8 @@ pip install "py-type-narrower[flake8]"
 flake8 your_package/
 ```
 
+Because `flake8` checks one file at a time (as does `py-type-narrower --tier 1` on individual files or `--no-project-index`), only same-file callers and class hierarchies are visible. Full-project CLI runs may suppress additional `NT101` findings (when another module passes a dynamic or out-of-set argument) or cross-file overrides.
+
 ### Pre-commit
 
 ```yaml

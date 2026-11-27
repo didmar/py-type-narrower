@@ -16,7 +16,13 @@ if TYPE_CHECKING:
 
 
 class TypeNarrowerChecker:
-    """Flake8 plugin running Tier 1 local type-narrowing rules (NT101, NT102, NT103)."""
+    """Flake8 plugin running Tier 1 local type-narrowing rules (NT101-NT109).
+
+    Flake8 invokes checkers one file at a time, so only same-file callers,
+    class hierarchies, enums, and TypedDicts are visible. Full-project CLI runs
+    may therefore suppress additional NT101 findings (when another module passes
+    a dynamic/out-of-set argument) or cross-file overrides.
+    """
 
     name = "py-type-narrower"
     version = __version__
