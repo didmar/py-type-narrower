@@ -145,8 +145,9 @@ def guarded(mode: str) -> int:
         raise ValueError(mode)
 
 def dynamic_caller(raw: str) -> int:
-    # Passing an arbitrary str breaks narrowing `mode` to Literal["a", "b"]!
-    return guarded(raw)
+    # Call through an alias so static call-site checks cannot see it; ty must reject NT101!
+    fn = guarded
+    return fn(raw)
 """
     mod.write_text(original, encoding="utf-8")
 

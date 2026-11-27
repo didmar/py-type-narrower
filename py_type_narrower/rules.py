@@ -271,6 +271,8 @@ def _rule_nt101_guarded_params(
                 matching = matching | {param.default_literal}
             else:
                 continue
+        if _has_incompatible_nt101_caller(func, param, matching, ctx.index):
+            continue
 
         suggested = format_literal_type(matching)
         evidence = [
@@ -328,6 +330,27 @@ def _collect_guarded_literals_for_param(
             matching.update(enum_cls.enum_values)
             reasons.append(f"Coerced via `{callee}({param.name})`")
     return (matching, reasons)
+
+
+def _has_incompatible_nt101_caller(
+    func: FunctionInfo,
+    param: ParamInfo,
+    matching: set[ExtractedLiteral],
+    index: CodebaseIndex,
+) -> bool:
+    """Return True if any indexed caller passes a non-literal or out-of-set argument to `param`."""
+    stats = index.call_stats.get((func.qualname, param.name))
+    if stats is None:
+        return False
+    if stats.has_dynamic_star_call:
+        return True
+    return any(
+        obs.is_unknown
+        or obs.is_none
+        or not obs.literals
+        or any(lit not in matching for lit in obs.literals)
+        for obs in stats.observations
+    )
 
 
 def _rule_nt102_unused_optional_return(

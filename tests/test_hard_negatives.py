@@ -480,3 +480,50 @@ class BashComplete(ShellComplete):
     assert ("stream", RuleCode.NT107) in found
     assert ("seq", RuleCode.NT107) in found
     assert ("_internal_dict", RuleCode.NT109) in found
+
+
+def test_hard_negative_nt101_skips_when_indexed_caller_passes_dynamic_or_out_of_set_arg(
+    tmp_path: Path,
+) -> None:
+    code = """from typing import Literal
+
+def validator_dynamic(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def validator_out_of_set(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def validator_star_call(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def safe_with_literal_callers(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def safe_standalone(mode: str) -> int:
+    if mode not in ("a", "b"):
+        raise ValueError(mode)
+    return 1
+
+def callers(raw: str, narrow: Literal["a", "b"], args: tuple[str]) -> None:
+    validator_dynamic(raw)
+    validator_out_of_set("invalid")
+    validator_star_call(*args)
+    safe_with_literal_callers("a")
+    safe_with_literal_callers(narrow)
+"""
+    cands = _run_on_code(tmp_path, code, max_tier=1)
+    nt101_fns = {c.symbol.rsplit(".", maxsplit=1)[-1] for c in cands if c.code == RuleCode.NT101}
+
+    assert "validator_dynamic" not in nt101_fns
+    assert "validator_out_of_set" not in nt101_fns
+    assert "validator_star_call" not in nt101_fns
+    assert "safe_with_literal_callers" in nt101_fns
+    assert "safe_standalone" in nt101_fns
