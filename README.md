@@ -4,37 +4,47 @@ A static analyzer and refactoring tool that detects overly broad Python type ann
 
 ```diff
 -from typing import Any
-+from typing import Any, Literal, TypedDict
++from typing import Any, Literal, TypedDict, NotRequired
 +
 +
-+class MetricsClientHealthDict(TypedDict):
-+    latency_ms: float
-+    ok: bool
-+    status: str
++class MetricsClientBuildEventDict(TypedDict):
++    kind: str
++    level: str
++    unit: NotRequired[str]
++    value: float
 
 
  class MetricsClient:
 -    endpoint: str | None
+-    scheme: str
 +    endpoint: str
++    scheme: Literal["http", "https"]
 
-     def __init__(self, endpoint: str) -> None:
+     def __init__(self, endpoint: str, secure: bool = True) -> None:
          self.endpoint = endpoint
+         if secure:
+             self.scheme = "https"
+         else:
+             self.scheme = "http"
 
--    def format_metric(self, kind: str, value: float) -> str | None:
-+    def format_metric(self, kind: Literal["counter", "gauge"], value: float) -> str:
-         if kind not in ("counter", "gauge"):
-             raise ValueError(f"Unknown metric kind: {kind}")
-         return f"{kind}={value}"
+     def build_event(
+-        self, kind: str, level: str, value: float
+-    ) -> dict[str, Any]:
++        self, kind: Literal["counter", "gauge"], level: Literal["error", "info", "warn"], value: float
++    ) -> MetricsClientBuildEventDict:
+         if level not in ("info", "warn", "error"):
+             raise ValueError(f"Unknown level: {level}")
+         match kind:
+             case "counter":
+                 return {"kind": kind, "level": level, "value": value}
+             case "gauge":
+                 return {"kind": kind, "level": level, "value": value, "unit": "ms"}
+             case _:
+                 raise ValueError(f"Unknown kind: {kind}")
 
--    def parse_timeout(self, raw: str) -> int | float | str:
+-    def parse_timeout(self, raw: str) -> int | float | str | None:
 +    def parse_timeout(self, raw: str) -> int | float:
-         if "." in raw:
-             return float(raw)
-         return int(raw)
-
--    def health(self, ok: bool, latency_ms: float) -> dict[str, Any]:
-+    def health(self, ok: bool, latency_ms: float) -> MetricsClientHealthDict:
-         return {"ok": ok, "status": "up" if ok else "down", "latency_ms": latency_ms}
+         return float(raw) if "." in raw else int(raw)
 ```
 
 ## Installation
