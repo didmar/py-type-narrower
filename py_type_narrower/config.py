@@ -50,6 +50,7 @@ class NarrowerConfig:
     verify_command: str | None = None
     include_test_files: bool = False
     index_project_root: bool = True
+    scaffold_typeddict: bool = False
 
     def active_rules(self) -> set[RuleCode]:
         """Return the set of enabled rule codes after applying ignores."""
@@ -99,6 +100,7 @@ def _apply_scalar_options(cfg: NarrowerConfig, section: dict[str, object]) -> No
         ("verify-command", "verify_command", str),
         ("include-test-files", "include_test_files", bool),
         ("index-project-root", "index_project_root", bool),
+        ("scaffold-typeddict", "scaffold_typeddict", bool),
     )
     for toml_key, attr, expected_type in scalar_spec:
         val = section.get(toml_key)

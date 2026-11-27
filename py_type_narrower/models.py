@@ -89,6 +89,19 @@ class CheckerDiagnostic:
         return f"{self.file}:{self.line}:{self.col}: {self.message}{rule_part}"
 
 
+@dataclass(frozen=True)
+class TypedDictScaffold:
+    """Specification for scaffolding a new module-level TypedDict definition."""
+
+    class_name: str
+    fields: tuple[tuple[str, str, bool], ...]  # (key, value_type, is_required)
+    anchor_symbol: str
+    use_functional_syntax: bool = False
+    total: bool = True
+    needs_not_required_import: bool = False
+    needs_any_import: bool = False
+
+
 @dataclass
 class NarrowingCandidate:
     """Proposed narrowing of a single parameter, return, or attribute type annotation."""
@@ -111,6 +124,7 @@ class NarrowingCandidate:
     is_single_constant: bool = False
     drop_none_default: bool = False
     is_fixable: bool = True
+    typeddict_scaffold: TypedDictScaffold | None = None
     verification: VerificationStatus = VerificationStatus.UNVERIFIED
     blocking_diagnostics: list[str] = field(default_factory=list)
 

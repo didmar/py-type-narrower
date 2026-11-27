@@ -63,13 +63,13 @@ Rules are split into two tiers by evidence strength:
 | `NT106` | 1 (Local) | Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal (`tuple[T1, T2]`) | Safe (default) |
 | `NT107` | 1 (Local) | Container or generator return (`list[T \| None]`, `dict[K, V \| None]`, `Iterator[T \| None]`, `Generator[T \| None, ...]`) never contains/yields `None` | Safe (default) |
 | `NT108` | 1 (Local) | Return type `Any` or `object` only returns concrete inferable type(s) | Safe (default) |
-| `NT109` | 1 (Local) | Structured `dict` return with constant string keys narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports a `TypedDict` schema | Safe when fixable |
+| `NT109` | 1 (Local) | Structured `dict` return with constant string keys narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Safe when fixable |
 | `NT201` | 2 (Codebase) | Parameter typed `str`/`int` only receives literals from a small set or `StrEnum`/`IntEnum` members across callers (also flags single-constant parameters) | Requires `--unsafe-fixes` |
 | `NT202` | 2 (Codebase) | Parameter typed `T \| None` never receives `None` across callers | Requires `--unsafe-fixes` |
 | `NT203` | 2 (Codebase) | Dataclass, `NamedTuple`, `attrs`, Pydantic `BaseModel`, or `TypedDict` field (`str`/`int`, `T \| None`, or `NotRequired[T]`) can be narrowed across instantiations and writes | Requires `--unsafe-fixes` |
 | `NT204` | 2 (Codebase) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
 | `NT205` | 2 (Codebase) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
-| `NT206` | 2 (Codebase) | Call-site structured `dict` parameter narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports a `TypedDict` schema | Requires `--unsafe-fixes` when fixable |
+| `NT206` | 2 (Codebase) | Call-site structured `dict` parameter narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Requires `--unsafe-fixes` when fixable |
 
 Narrowing automatically skips `@no_type_check` code, `Protocol`s, `ABC`s, `@abstractmethod`s, subclass overrides, overridden base-class return hooks, PEP 562 module hooks (`__getattr__`, `__dir__`), and fixed Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, `__getattr__`, etc.) to preserve Liskov substitution and runtime contracts.
 

@@ -168,6 +168,12 @@ def _add_common_options(subparser: argparse.ArgumentParser) -> None:
         help="Git ref to diff against (implies --changed, e.g. 'main' or 'origin/main')",
     )
     subparser.add_argument(
+        "--scaffold-typeddict",
+        action="store_true",
+        default=None,
+        help="Generate named TypedDict definitions for NT109/NT206 dict narrowings",
+    )
+    subparser.add_argument(
         "--max-literals",
         type=int,
         default=None,
@@ -251,6 +257,8 @@ def _apply_cli_overrides(config: NarrowerConfig, args: argparse.Namespace) -> No
         config.exclude.extend(args.exclude)
     if args.index_project_root is False:
         config.index_project_root = False
+    if args.scaffold_typeddict is True:
+        config.scaffold_typeddict = True
 
 
 def _discover_git_changed_files(

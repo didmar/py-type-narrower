@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import keyword
+import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -28,6 +30,7 @@ from py_type_narrower.models import (
     RuleCode,
     TargetKind,
     Tier,
+    TypedDictScaffold,
 )
 from py_type_narrower.scorer import (
     CallSiteScoreContext,
@@ -961,9 +964,36 @@ class _DictNarrowingResolution:
     needs_literal_import: bool
     matched_existing_td: bool
     detail: str
+    scaffold: TypedDictScaffold | None = None
 
 
 _MAX_TYPEDDICT_KEYS = 12
+_BARE_CONTAINER_DEFAULTS: dict[str, str] = {
+    "list": "list[Any]",
+    "dict": "dict[str, Any]",
+    "set": "set[Any]",
+    "frozenset": "frozenset[Any]",
+    "tuple": "tuple[Any, ...]",
+}
+_BUILTIN_TYPE_NAMES: frozenset[str] = frozenset(
+    {
+        "str",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+        "complex",
+        "None",
+        "Any",
+        "object",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+    }
+)
+_IDENT_TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 
 
 def _rule_nt109_structured_dict_return(
@@ -997,9 +1027,9 @@ def _rule_nt109_structured_dict_return(
     resolution = _resolve_structured_dict_narrowing(
         dict_spec=dict_spec,
         shape=shape,
-        module_name=func.module_name,
-        index=ctx.index,
-        max_literals=ctx.config.max_literals,
+        func=func,
+        param_name=None,
+        ctx=ctx,
     )
     if resolution is None:
         return []
@@ -1035,6 +1065,7 @@ def _rule_nt109_structured_dict_return(
             ),
             is_public=not func.is_private,
             is_fixable=resolution.is_fixable,
+            typeddict_scaffold=resolution.scaffold,
         )
     ]
 
@@ -1059,9 +1090,9 @@ def _rule_nt206_callsite_structured_dict(
     resolution = _resolve_structured_dict_narrowing(
         dict_spec=dict_spec,
         shape=shape,
-        module_name=func.module_name,
-        index=ctx.index,
-        max_literals=ctx.config.max_literals,
+        func=func,
+        param_name=param.name,
+        ctx=ctx,
     )
     if resolution is None:
         return None
@@ -1106,6 +1137,7 @@ def _rule_nt206_callsite_structured_dict(
         score=score,
         is_public=not func.is_private,
         is_fixable=resolution.is_fixable,
+        typeddict_scaffold=resolution.scaffold,
     )
 
 
@@ -1141,16 +1173,17 @@ def _resolve_structured_dict_narrowing(
     *,
     dict_spec: DictAnnotationSpec,
     shape: _DictShape,
-    module_name: str,
-    index: CodebaseIndex,
-    max_literals: int,
+    func: FunctionInfo,
+    param_name: str | None,
+    ctx: _RuleEvalContext,
 ) -> _DictNarrowingResolution | None:
-    """Choose best narrowing: existing in-scope TypedDict, dict[Literal, V], or TypedDict schema."""
+    """Choose best narrowing: existing in-scope TypedDict, dict[Literal, V], or TypedDict schema/scaffold."""
+    max_literals = ctx.config.max_literals
     key_count = len(shape.key_presence)
     if key_count == 0 or key_count > max(max_literals, _MAX_TYPEDDICT_KEYS):
         return None
 
-    matched_td = _find_matching_typeddict(shape, module_name, index)
+    matched_td = _find_matching_typeddict(shape, func.module_name, ctx.index)
     if matched_td is not None:
         keys_str = ", ".join(repr(k) for k in sorted(shape.key_presence))
         return _DictNarrowingResolution(
@@ -1179,6 +1212,16 @@ def _resolve_structured_dict_narrowing(
 
     if dict_spec.is_broad_value:
         schema = _format_typeddict_suggestion(shape)
+        if ctx.config.scaffold_typeddict:
+            scaffold = _build_typeddict_scaffold(shape, func, param_name, ctx.index)
+            return _DictNarrowingResolution(
+                suggested_type=scaffold.class_name,
+                is_fixable=True,
+                needs_literal_import=False,
+                matched_existing_td=False,
+                detail=f"Scaffold TypedDict `{scaffold.class_name}` with fields: {schema}",
+                scaffold=scaffold,
+            )
         return _DictNarrowingResolution(
             suggested_type=schema,
             is_fixable=False,
@@ -1187,6 +1230,113 @@ def _resolve_structured_dict_narrowing(
             detail=f"Consider defining a TypedDict with fields: {schema}",
         )
     return None
+
+
+def _build_typeddict_scaffold(
+    shape: _DictShape,
+    func: FunctionInfo,
+    param_name: str | None,
+    index: CodebaseIndex,
+) -> TypedDictScaffold:
+    """Construct a module-level TypedDictScaffold specification from an observed _DictShape."""
+    visible_names = _module_visible_type_names(func.module_name, index)
+    fields: list[tuple[str, str, bool]] = []
+    for key in sorted(shape.key_presence):
+        val_str = _resolve_scaffold_field_type(key, shape, visible_names)
+        is_required = shape.key_presence[key] >= shape.sample_count
+        fields.append((key, val_str, is_required))
+
+    all_optional = all(not is_req for _, _, is_req in fields)
+    total = not all_optional
+    needs_not_required = total and any(not is_req for _, _, is_req in fields)
+    needs_any = any("Any" in _IDENT_TOKEN_RE.findall(val_str) for _, val_str, _ in fields)
+    use_functional = any(not key.isidentifier() or keyword.iskeyword(key) for key, _, _ in fields)
+    class_name = _make_scaffold_class_name(func, param_name, index)
+    anchor_symbol = (
+        func.class_name.split(".", maxsplit=1)[0]
+        if (func.is_method and func.class_name is not None)
+        else func.name
+    )
+    return TypedDictScaffold(
+        class_name=class_name,
+        fields=tuple(fields),
+        anchor_symbol=anchor_symbol,
+        use_functional_syntax=use_functional,
+        total=total,
+        needs_not_required_import=needs_not_required,
+        needs_any_import=needs_any,
+    )
+
+
+def _resolve_scaffold_field_type(
+    key: str,
+    shape: _DictShape,
+    visible_names: set[str],
+) -> str:
+    """Resolve a concrete, module-visible type string for a scaffolded TypedDict field."""
+    if key in shape.key_unknown or not shape.key_types.get(key):
+        return "Any"
+    normalized: set[str] = set()
+    for raw in shape.key_types[key]:
+        mapped = _BARE_CONTAINER_DEFAULTS.get(raw.strip(), raw.strip())
+        if _all_type_tokens_visible(mapped, visible_names):
+            normalized.add(mapped)
+        else:
+            return "Any"
+    ordered = sorted(t for t in normalized if t != "None")
+    if "None" in normalized:
+        ordered.append("None")
+    return format_union_type(ordered)
+
+
+def _all_type_tokens_visible(type_str: str, visible_names: set[str]) -> bool:
+    """Return True if every identifier in `type_str` is a builtin or visible in the module."""
+    tokens = _IDENT_TOKEN_RE.findall(type_str)
+    return all(tok in _BUILTIN_TYPE_NAMES or tok in visible_names for tok in tokens)
+
+
+def _make_scaffold_class_name(
+    func: FunctionInfo,
+    param_name: str | None,
+    index: CodebaseIndex,
+) -> str:
+    """Generate a collision-free PascalCase TypedDict class name for a function or parameter."""
+    raw_parts: list[str] = []
+    if func.class_name is not None:
+        raw_parts.extend(func.class_name.split("."))
+    raw_parts.append(func.name)
+    if param_name is not None:
+        raw_parts.append(param_name)
+
+    camel = "".join(_to_pascal_case(part) for part in raw_parts) or "Record"
+    prefix = "_" if (func.is_private or func.name.startswith("_")) else ""
+    base_name = f"{prefix}{camel}Dict"
+
+    used = _module_visible_type_names(func.module_name, index)
+    for fn in index.functions.values():
+        if fn.module_name == func.module_name and not fn.is_method:
+            used.add(fn.name)
+    if base_name not in used:
+        return base_name
+    suffix = 2
+    while f"{base_name}{suffix}" in used:
+        suffix += 1
+    return f"{base_name}{suffix}"
+
+
+def _module_visible_type_names(module_name: str, index: CodebaseIndex) -> set[str]:
+    """Collect class names and imported symbols visible at top level in `module_name`."""
+    names: set[str] = set(index.module_imports.get(module_name, {}).keys())
+    for cls in index.classes.values():
+        if cls.module_name == module_name:
+            names.add(cls.name)
+    return names
+
+
+def _to_pascal_case(raw: str) -> str:
+    """Convert snake_case or mixed identifiers to PascalCase while preserving internal capitals."""
+    chunks = [chunk for chunk in raw.strip("_").split("_") if chunk]
+    return "".join(chunk[0].upper() + chunk[1:] for chunk in chunks)
 
 
 def _find_matching_typeddict(

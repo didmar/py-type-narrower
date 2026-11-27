@@ -1,10 +1,13 @@
 from pathlib import Path
 
+from py_type_narrower.cli import main
 from py_type_narrower.config import NarrowerConfig
+from py_type_narrower.engine import RunOptions, analyze_paths
 from py_type_narrower.indexer import index_files
 from py_type_narrower.models import RuleCode, TargetKind, Tier
 from py_type_narrower.rewriter import rewrite_module_source
 from py_type_narrower.rules import run_rules
+from py_type_narrower.verifier import TyAdapter
 
 
 def test_nt104_always_initialized_class_attributes_and_rewriter(tmp_path: Path) -> None:
@@ -734,3 +737,99 @@ class Completer:
         nt109[0].suggested_type
         == "TypedDict({'formatter': list[str], 'ports': set[int], 'prog_name': str, 'retries': int, 'tag': str})"
     )
+
+
+def test_scaffold_typeddict_class_functional_and_ty_verification(tmp_path: Path) -> None:
+    code = """from typing import Any
+
+def _default_config(flag: bool) -> dict[str, Any]:
+    if flag:
+        return {
+            "formatter": ["black", "-"],
+            "items": [],
+            "repo_root": ".",
+            "tls": True,
+        }
+    return {
+        "formatter": ["ruff"],
+        "items": [],
+        "repo_root": ".",
+    }
+
+def build_headers() -> dict[str, Any]:
+    return {"Content-Type": "application/json", "X-Count": 1}
+
+class Skills:
+    def settings(self, enabled: bool) -> dict[str, Any]:
+        return {"directoryRead": True} if enabled else {}
+"""
+    mod = tmp_path / "scaffold_demo.py"
+    mod.write_text(code, encoding="utf-8")
+
+    cfg = NarrowerConfig(max_tier=1, scaffold_typeddict=True, verify=TyAdapter().is_available())
+    result = analyze_paths(
+        [mod],
+        project_root=tmp_path,
+        config=cfg,
+        options=RunOptions(apply_fixes=True),
+    )
+
+    assert result.rejected == []
+    assert len(result.applied) == 3
+
+    rewritten = mod.read_text(encoding="utf-8")
+    assert "TypedDict" in rewritten
+    assert "NotRequired" in rewritten
+    assert "class _DefaultConfigDict(TypedDict):" in rewritten
+    assert "    formatter: list[str]" in rewritten
+    assert "    items: list[Any]" in rewritten
+    assert "    tls: NotRequired[bool]" in rewritten
+    assert "def _default_config(flag: bool) -> _DefaultConfigDict:" in rewritten
+
+    assert "BuildHeadersDict = TypedDict(" in rewritten
+    assert "'Content-Type': str," in rewritten
+    assert "def build_headers() -> BuildHeadersDict:" in rewritten
+
+    assert "class SkillsSettingsDict(TypedDict, total=False):" in rewritten
+    assert "    directoryRead: bool" in rewritten
+    assert "    def settings(self, enabled: bool) -> SkillsSettingsDict:" in rewritten
+
+    # Re-running after scaffolding should produce zero new NT109 findings!
+    recheck = analyze_paths([mod], project_root=tmp_path, config=cfg)
+    assert [c for c in recheck.candidates if c.code == RuleCode.NT109] == []
+
+
+def test_scaffold_typeddict_for_nt206_param_and_cli_flag(tmp_path: Path, capsys) -> None:
+    mod = tmp_path / "param_scaffold.py"
+    mod.write_text(
+        """from typing import Any
+
+def _log_extra(meta: dict[str, Any]) -> None:
+    _ = meta
+
+def caller() -> None:
+    _log_extra({"env": "prod", "retries": 2})
+    _log_extra({"env": "dev"})
+""",
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "fix",
+            str(mod),
+            "--closed-world",
+            "--unsafe-fixes",
+            "--scaffold-typeddict",
+            "--verify",
+            "--verifier",
+            "ty",
+        ]
+    )
+    _ = capsys.readouterr()
+    assert rc == 0
+    rewritten = mod.read_text(encoding="utf-8")
+    assert "class _LogExtraMetaDict(TypedDict):" in rewritten
+    assert "    env: str" in rewritten
+    assert "    retries: NotRequired[int]" in rewritten
+    assert "def _log_extra(meta: _LogExtraMetaDict) -> None:" in rewritten
