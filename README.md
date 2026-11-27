@@ -1,6 +1,41 @@
 # py-type-narrower
 
-A LibCST-powered static analyzer and refactoring tool that detects overly broad Python type annotations (like `str`, `int`, `bool`, `T | None`, or `A | B | C`) and suggests or applies narrower types (like `Literal["a", "b"]`, `T`, or `A | B`), with optional **soundness verification** backed by your preferred type checker (`ty`, `mypy`, `pyright`, `basedpyright`, or a custom command).
+A static analyzer and refactoring tool that detects overly broad Python type annotations and suggests or applies narrower types, optionally backed by your preferred type checker.
+
+```diff
+-from typing import Any
++from typing import Any, Literal, TypedDict
++
++
++class MetricsClientHealthDict(TypedDict):
++    latency_ms: float
++    ok: bool
++    status: str
+
+
+ class MetricsClient:
+-    endpoint: str | None
++    endpoint: str
+
+     def __init__(self, endpoint: str) -> None:
+         self.endpoint = endpoint
+
+-    def format_metric(self, kind: str, value: float) -> str | None:
++    def format_metric(self, kind: Literal["counter", "gauge"], value: float) -> str:
+         if kind not in ("counter", "gauge"):
+             raise ValueError(f"Unknown metric kind: {kind}")
+         return f"{kind}={value}"
+
+-    def parse_timeout(self, raw: str) -> int | float | str:
++    def parse_timeout(self, raw: str) -> int | float:
+         if "." in raw:
+             return float(raw)
+         return int(raw)
+
+-    def health(self, ok: bool, latency_ms: float) -> dict[str, Any]:
++    def health(self, ok: bool, latency_ms: float) -> MetricsClientHealthDict:
+         return {"ok": ok, "status": "up" if ok else "down", "latency_ms": latency_ms}
+```
 
 ## Installation
 
@@ -17,118 +52,67 @@ pip install py-type-narrower
 
 Requires Python 3.12+.
 
-## Quick Example
+## Usage
 
-```python
-# Before
-def format_status(mode: str, code: int) -> str | None:
-    if mode not in ("short", "long"):
-        raise ValueError(f"Unknown mode: {mode}")
-    return f"{mode}:{code}"
+```bash
+# See what can be narrowed
+py-type-narrower check .
+
+# Preview the proposed changes as a diff
+py-type-narrower diff .
+
+# Apply safe fixes in place and verify them with your type checker
+py-type-narrower fix . --verify
 ```
 
-Running `py-type-narrower fix . --verify` narrows both annotations and adds the `Literal` import:
+Other options:
+- `--verify` / `--verifier` — Runs your type checker (`auto`, `ty`, `mypy`, `pyright`, `basedpyright`, or `custom` with `--verify-command`) on a shadow copy of the project and automatically drops any change that introduces a type error. Recommended whenever running `fix`.
+- `--closed-world` — Use this for applications or internal services where all callers live in the repo (as opposed to a public library). Unlocks narrowing on public functions and methods.
+- `--unsafe-fixes` — Also apply Tier 2 fixes inferred from call sites across your codebase (`fix` only applies local Tier 1 fixes by default).
+- `--scaffold-typeddict` — Generate `TypedDict` classes for functions returning or accepting fixed-key `dict`s (otherwise reported as advisory suggestions).
+- `--changed` / `--diff-base main` — Only check or fix files modified in git or on the current branch, which is useful for gradual adoption or CI.
+- `--format` — Output format for `check`: `text` (default), `json`, or `sarif` (for editors and GitHub Code Scanning).
+- `-v` / `--show-rejected` — Show why each narrowing was suggested, or why `--verify` rejected one.
 
-```python
-from typing import Literal
+## Rules
 
+Rules are split into two tiers: **Tier 1 (Local)** rules prove narrower types from a function or class body alone and are safe to auto-fix; **Tier 2 (Codebase)** rules infer narrower types from call sites across the project and require `--unsafe-fixes`.
 
-# After
-def format_status(mode: Literal["long", "short"], code: int) -> str:
-    if mode not in ("short", "long"):
-        raise ValueError(f"Unknown mode: {mode}")
-    return f"{mode}:{code}"
-```
+| Code | Tier | Description | Auto-fix |
+| :--- | :---: | :--- | :---: |
+| `NT101` | 1 (Local) | Parameter typed `str`/`int` is exhaustively guarded to literals in the function body (`if/elif/else raise`, negative guard + raise, `match`, constant dict subscript, or `StrEnum`/`IntEnum` coercion) | Safe |
+| `NT102` | 1 (Local) | Return type `T \| None` / `Optional[T]` never returns `None` along any path | Safe |
+| `NT103` | 1 (Local) | Return type `str`/`int` only returns constant literals or `StrEnum`/`IntEnum` members | Safe |
+| `NT104` | 1 (Local) | Class attribute narrowed locally (`T \| None` always initialized non-`None`, `str`/`int` only assigned literals, or union with unused branch(es)) | Safe |
+| `NT105` | 1 (Local) | Return union `A \| B \| C` has unused branch(es) | Safe |
+| `NT106` | 1 (Local) | Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal (`tuple[T1, T2]`) | Safe |
+| `NT107` | 1 (Local) | Container or generator return (`list[T \| None]`, `dict[K, V \| None]`, `Iterator[T \| None]`, `Generator[T \| None, ...]`) never contains/yields `None` | Safe |
+| `NT108` | 1 (Local) | Return type `Any` or `object` only returns concrete inferable type(s) | Safe |
+| `NT109` | 1 (Local) | Structured `dict` return with constant string keys narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Safe* |
+| `NT201` | 2 (Codebase) | Parameter typed `str`/`int` only receives literals from a small set or `StrEnum`/`IntEnum` members across callers (also flags single-constant parameters) | Unsafe |
+| `NT202` | 2 (Codebase) | Parameter typed `T \| None` never receives `None` across callers | Unsafe |
+| `NT203` | 2 (Codebase) | Dataclass, `NamedTuple`, `attrs`, Pydantic `BaseModel`, or `TypedDict` field (`str`/`int`, `T \| None`, or `NotRequired[T]`) can be narrowed across instantiations and writes | Unsafe |
+| `NT204` | 2 (Codebase) | Parameter union `A \| B \| C` has unused branch(es) across callers | Unsafe |
+| `NT205` | 2 (Codebase) | Boolean parameter always receives a single constant (`True` or `False`) | Unsafe |
+| `NT206` | 2 (Codebase) | Call-site structured `dict` parameter narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Unsafe* |
 
-## Design Philosophy & Non-Goals
+*\* `NT109` and `NT206` auto-fix directly when matching an existing `TypedDict` or `dict[Literal[...], V]`; generating a new `TypedDict` is advisory unless `--scaffold-typeddict` is passed.*
 
-`py-type-narrower` is built to **complement** static type checkers (`ty`, `mypy`, `pyright`), not replace or duplicate them. Standard type checkers verify *soundness* and deliberately permit annotations that are looser than actual usage.
+To preserve Liskov substitution and runtime contracts, narrowing automatically skips:
+- `@no_type_check` code
+- `Protocol`s, `ABC`s, and `@abstractmethod`s
+- Subclass overrides (`@override` or inherited methods) and public methods on external subclasses when narrowing would break subtyping
+- Overridden base-class return hooks
+- PEP 562 module hooks (`__getattr__`, `__dir__`) and Python data-model methods (`__repr__`, `__str__`, `__exit__`, `__getattr__`, etc.)
 
-Out of scope (already handled by type checkers or Ruff):
+`py-type-narrower` is meant to complement type checkers and linters rather than duplicate them, so the following are intentionally out of scope:
 - Redundant casts or unnecessary `isinstance` checks (`--warn-redundant-casts`, `reportUnnecessaryIsInstance`)
 - Duplicate union members (`int | int`)
 - Missing annotations (`ruff ANN`, `--disallow-untyped-defs`) or bare `Any` bans (`ANN401`, `--disallow-any-explicit`)
 
-## Rules & Tiers
+## Configuration
 
-Rules are split into two tiers by evidence strength:
-
-| Code | Tier | Description | Auto-fix (`fix`) |
-| :--- | :---: | :--- | :--- |
-| `NT101` | 1 (Local) | Parameter typed `str`/`int` is exhaustively guarded to literals in the function body (`if/elif/else raise`, negative guard + raise, `match`, constant dict subscript, or `StrEnum`/`IntEnum` coercion) | Safe (default) |
-| `NT102` | 1 (Local) | Return type `T \| None` / `Optional[T]` never returns `None` along any path | Safe (default) |
-| `NT103` | 1 (Local) | Return type `str`/`int` only returns constant literals or `StrEnum`/`IntEnum` members | Safe (default) |
-| `NT104` | 1 (Local) | Class attribute narrowed locally (`T \| None` always initialized non-`None`, `str`/`int` only assigned literals, or union with unused branch(es)) | Safe (default) |
-| `NT105` | 1 (Local) | Return union `A \| B \| C` has unused branch(es) | Safe (default) |
-| `NT106` | 1 (Local) | Variadic `tuple[T, ...]` return always yields a fixed-length tuple literal (`tuple[T1, T2]`) | Safe (default) |
-| `NT107` | 1 (Local) | Container or generator return (`list[T \| None]`, `dict[K, V \| None]`, `Iterator[T \| None]`, `Generator[T \| None, ...]`) never contains/yields `None` | Safe (default) |
-| `NT108` | 1 (Local) | Return type `Any` or `object` only returns concrete inferable type(s) | Safe (default) |
-| `NT109` | 1 (Local) | Structured `dict` return with constant string keys narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Safe when fixable |
-| `NT201` | 2 (Codebase) | Parameter typed `str`/`int` only receives literals from a small set or `StrEnum`/`IntEnum` members across callers (also flags single-constant parameters) | Requires `--unsafe-fixes` |
-| `NT202` | 2 (Codebase) | Parameter typed `T \| None` never receives `None` across callers | Requires `--unsafe-fixes` |
-| `NT203` | 2 (Codebase) | Dataclass, `NamedTuple`, `attrs`, Pydantic `BaseModel`, or `TypedDict` field (`str`/`int`, `T \| None`, or `NotRequired[T]`) can be narrowed across instantiations and writes | Requires `--unsafe-fixes` |
-| `NT204` | 2 (Codebase) | Parameter union `A \| B \| C` has unused branch(es) across callers | Requires `--unsafe-fixes` |
-| `NT205` | 2 (Codebase) | Boolean parameter always receives a single constant (`True` or `False`) | Requires `--unsafe-fixes` |
-| `NT206` | 2 (Codebase) | Call-site structured `dict` parameter narrows to an existing `TypedDict`, `dict[Literal[...], V]`, or reports/scaffolds a `TypedDict` (`--scaffold-typeddict`) | Requires `--unsafe-fixes` when fixable |
-
-Narrowing automatically skips `@no_type_check` code, `Protocol`s, `ABC`s, `@abstractmethod`s, subclass overrides, overridden base-class return hooks, PEP 562 module hooks (`__getattr__`, `__dir__`), and fixed Python data-model protocol methods (`__repr__`, `__str__`, `__exit__`, `__getattr__`, etc.) to preserve Liskov substitution and runtime contracts.
-
-## Usage
-
-```bash
-# Report all candidates with evidence and confidence scores
-py-type-narrower check . -v
-
-# Check only Tier 1 high-confidence rules
-py-type-narrower check . --tier 1
-
-# Run in closed-world (application) mode and verify soundness with ty
-py-type-narrower check . --closed-world --verify --verifier ty -v --show-rejected
-
-# Preview unified diffs
-py-type-narrower diff .
-
-# Apply safe (Tier 1) fixes in place, verified by a type checker
-py-type-narrower fix . --verify --verifier ty
-
-# Apply Tier 1 + Tier 2 fixes with multi-pass fixpoint propagation
-py-type-narrower fix . --closed-world --unsafe-fixes --max-passes 3 --verify
-
-# Check only git-changed files (or branch diff vs main) while still indexing the full project
-py-type-narrower check --changed --closed-world
-py-type-narrower check --diff-base main --closed-world --verify
-```
-
-### Configurable Soundness Verifier
-
-Pass `--verify` to validate candidates against a type-checker baseline inside a lightweight symlinked shadow workspace (your working tree is never touched during verification). If a batch introduces new type errors, the verifier bisects to isolate the safe subset and reports the blocking type errors on rejected candidates.
-
-Supported `--verifier` values:
-- `auto` (default): detects from `pyproject.toml` (`[tool.ty]`, `[tool.basedpyright]`, `[tool.pyright]`, `[tool.mypy]`) or available binaries in `PATH`
-- `ty`
-- `mypy`
-- `pyright`
-- `basedpyright`
-- `custom` (paired with `--verify-command "uv run mypy src"`)
-
-### Output Formats
-
-```bash
-py-type-narrower check . --format text   # Ruff-style diagnostics (default)
-py-type-narrower check . --format json   # Structured JSON with evidence & scores
-py-type-narrower check . --format sarif  # SARIF 2.1.0 for editors & GitHub Code Scanning
-```
-
-### Inline Ignores
-
-Suppress specific rules or all rules on a line (or the line directly above a definition):
-
-```python
-def handle(mode: str) -> int:  # type-narrow: ignore[NT201]
-    ...
-```
-
-### Configuration (`pyproject.toml`)
+Configure defaults in `pyproject.toml`:
 
 ```toml
 [tool.py-type-narrower]
@@ -144,7 +128,18 @@ select = ["NT101", "NT102", "NT103", "NT104", "NT105", "NT106", "NT107", "NT108"
 ignore = []
 ```
 
-### Optional Flake8 Plugin
+### Inline Ignores
+
+Suppress specific rules or all rules on a line (or the line directly above a definition):
+
+```python
+def handle(mode: str) -> int:  # type-narrow: ignore[NT201]
+    ...
+```
+
+## Integrations
+
+### Flake8 Plugin
 
 Install with the `flake8` extra to expose Tier 1 (`NT101`–`NT109`) single-file rules directly in `flake8`:
 
